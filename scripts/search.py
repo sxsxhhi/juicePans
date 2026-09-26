@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""多源网盘资源搜索（仅标准库）。默认：公开盘搜 + 海搜 + 小云搜索；可选：盘小子、TG 聚合库、影视库、自建 PanSou。"""
+"""多源网盘资源搜索（仅标准库）。默认：公开盘搜 + 海搜 + 小云搜索；可选 TA搜、盘小子、影视库；默认源无果时自动 ataw 兜底。"""
 
 from __future__ import annotations
 
@@ -28,7 +28,12 @@ HAISOU_API = "https://haisou.cc/api/v2"
 MOVIE_API = "https://meng-ge.top/api/movieData/getMoviesByType"
 YUNSO_API = "https://www.yunso.net/api/opensearch.php"
 PANXIAOZI_BASE = "https://pan.xiaozi.cc"
-GHSPIDER_API = "https://api.github.com/repos/John-h-netdisk/netdisk-spider/contents/data"
+ATAW_BASE = "https://so.ataw.top"
+ATAW_BIZ = ("quark", "ali", "sharepan")
+ATAW_BIZ_CLOUD = {"quark": "quark", "ali": "aliyun", "sharepan": "others"}
+ATAW_RESOURCE_RE = re.compile(r"/resources/(\d+)\?b=(quark|ali|sharepan)", re.I)
+DEFAULT_ENGINES = frozenset({"pansou", "haisou", "yunso"})
+SKILL_VERSION = "1.7.5"
 
 # 引擎熔断状态文件（借鉴 PanSeek「失败插件自动降级」；可用环境变量改路径）
 ENGINE_STATE_PATH = os.environ.get("ENGINE_STATE_PATH") or os.path.expanduser("~/.pan_search/engine_state.json")
@@ -180,7 +185,7 @@ def http_json(url: str, *, method="GET", body=None, timeout=45, insecure=False, 
     data = None if body is None else json.dumps(body, ensure_ascii=False).encode("utf-8")
     hdrs = {
         "Accept": "application/json",
-        "User-Agent": "Mozilla/5.0 (compatible; PanSearch-Skill/1.0)",
+        "User-Agent": "Mozilla/5.0 (compatible; juicePans/%s)" % SKILL_VERSION,
     }
     if data is not None:
         hdrs["Content-Type"] = "application/json; charset=utf-8"
@@ -532,68 +537,122 @@ def search_panxiaozi(kw: str, limit: int):
     return out, len(found)
 
 
-def gh_json(url, *, timeout=25, headers=None):
-    """GitHub 匿名 API 限流 60 次/时/IP；429/403 按 Retry-After 或指数退避重试
-    （借鉴 tg-index-enhanced 的 FloodWait 指数退避思路）。"""
-    last = None
-    for attempt in range(3):
-        try:
-            return http_json(url, timeout=timeout, headers=headers)
-        except urllib.error.HTTPError as e:
-            last = e
-            if e.code not in (403, 429):
-                raise
-            if attempt == 2:
-                raise
-            ra = (e.headers or {}).get("Retry-After") if e.headers else None
-            try:
-                wait = float(ra)
-            except (TypeError, ValueError):
-                wait = 2.0 * (2 ** attempt)
-            time.sleep(min(wait, 30.0))
-        except Exception as e:
-            last = e
-            if attempt == 2:
-                raise
-            time.sleep(1.0 * (2 ** attempt))
-    raise last or RuntimeError("ghspider 请求失败")
+def ataw_cloud(biz: str, url: str) -> str:
+    code = ATAW_BIZ_CLOUD.get((biz or "").strip().lower())
+    if code and code != "others":
+        return code
+    return cloud_from_url(url)
 
 
-def search_ghspider(kw: str):
-    """netdisk-spider（TG 频道爬虫聚合数据，仓库每 6 小时自动更新）：拉最新 JSON 本地过滤。"""
-    payload = gh_json(GHSPIDER_API + "?per_page=100", timeout=25,
-                      headers={"Accept": "application/vnd.github+json"})
-    entries = [e for e in payload if isinstance(e, dict) and (e.get("name") or "").startswith("batch_github_")]
-    if not entries:
-        raise RuntimeError("netdisk-spider 数据目录为空")
-    latest = sorted(entries, key=lambda e: e.get("name") or "")[-1]
-    dl = latest.get("download_url") or ""
-    if not dl:
-        raise RuntimeError("未取得 netdisk-spider 数据下载地址")
-    blob = gh_json(dl, timeout=40)
-    rows = blob.get("results") or []
-    kw_l = kw.strip().lower()
-    tokens = [t for t in re.split(r"\s+", kw_l) if t]
-
-    def hit(t):
-        title = (t.get("title") or "").lower()
-        return (kw_l in title) if not tokens else all(x in title for x in tokens)
-
-    matched = [t for t in rows if isinstance(t, dict) and hit(t)]
-    matched.sort(key=lambda t: t.get("msg_time") or "", reverse=True)
+def _ataw_search_ids(kw: str, biz: str, cap: int) -> list[tuple[str, str]]:
+    qs = urllib.parse.urlencode({"q": kw, "b": biz})
+    html = http_html(ATAW_BASE + "/?" + qs, timeout=30)
+    seen = set()
     out = []
-    for t in matched[:30]:
-        out.append(
-            item(
-                t.get("pan_type") or "others",
-                t.get("share_url") or "",
-                t.get("share_password") or "",
-                t.get("title") or "",
-                "ghspider:" + (t.get("source") or ""),
-                (t.get("msg_time") or "")[:10],
-            )
-        )
-    return out, len(matched)
+    for m in ATAW_RESOURCE_RE.finditer(html):
+        rid, b = m.group(1), m.group(2).lower()
+        key = (rid, b)
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(key)
+        if len(out) >= cap:
+            break
+    return out
+
+
+def _ataw_detail_rows(rid: str, biz_hint: str) -> list[dict]:
+    data = http_json(ATAW_BASE + "/api/v1/public/resources/" + rid, timeout=25)
+    if data.get("isDeleted"):
+        return []
+    title = (data.get("title") or "").strip()
+    desc = (data.get("description") or "").strip()
+    short = (desc[:80] + "…") if len(desc) > 80 else desc
+    note = title + (("：" + short) if short else "")
+    dt = ms_to_iso(data.get("submitTime") or data.get("updateTime") or "")
+    biz = (data.get("botBiz") or biz_hint or "").lower()
+    link_rows = data.get("links") or []
+    if not link_rows and data.get("link"):
+        link_rows = [{"platform": biz, "url": data.get("link")}]
+    rows = []
+    for lk in link_rows:
+        if not isinstance(lk, dict):
+            continue
+        url = (lk.get("url") or "").strip()
+        if not url or not is_share_url(url):
+            continue
+        plat = (lk.get("platform") or biz or "").lower()
+        src = plat if plat in ATAW_BIZ_CLOUD else biz
+        rows.append(item(ataw_cloud(plat, url), url, "", note, "ataw:%s" % (src or "unknown"), dt))
+    return rows
+
+
+def search_ataw(kw: str, limit: int = 8):
+    """TA搜（so.ataw.top）：SSR 搜索页 `/?q=&b=` + 详情 `GET /api/v1/public/resources/{id}`；单 biz 失败不中断。"""
+    per_biz = max(3, min(limit, 12))
+    hints = []
+    biz_errors = []
+    for biz in ATAW_BIZ:
+        try:
+            hints.extend(_ataw_search_ids(kw, biz, per_biz))
+        except Exception as e:
+            biz_errors.append("%s: %s" % (biz, e))
+    by_id = {}
+    for rid, b in hints:
+        by_id.setdefault(rid, b)
+    targets = list(by_id.items())[: max(1, min(limit, 15))]
+    out = []
+    if targets:
+        with ThreadPoolExecutor(max_workers=4) as pool:
+            futs = {pool.submit(_ataw_detail_rows, rid, b): rid for rid, b in targets}
+            for fut in as_completed(futs):
+                try:
+                    out.extend(fut.result())
+                except Exception:
+                    pass
+    if not out and biz_errors and not by_id:
+        raise RuntimeError("ataw: " + "; ".join(biz_errors[:3]))
+    return out, len(by_id)
+
+
+def has_usable_urls(items: list) -> bool:
+    return any(is_share_url((r.get("url") or "")) for r in items)
+
+
+def should_ataw_fallback(engines: list, items: list) -> bool:
+    if "ataw" in engines:
+        return False
+    if not DEFAULT_ENGINES.intersection(engines):
+        return False
+    return not has_usable_urls(items)
+
+
+def finalize_items(items: list, args, cloud_types, include, exclude) -> list:
+    seen = set()
+    merged = []
+    for rec in items:
+        if not pass_filters(rec, include, exclude, cloud_types):
+            continue
+        key = norm_url(rec["url"])
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        merged.append(rec)
+    merged.sort(key=lambda r: r.get("datetime") or "", reverse=True)
+    merged.sort(key=lambda r: (-kw_hits(r, args.kw), ENGINE_RANK.get(r.get("source") or "", 5)))
+    dead = load_dead_links()
+    if dead:
+        merged.sort(key=lambda r: norm_url(r["url"]) in dead)
+    if args.limit > 0:
+        counts = {}
+        trimmed = []
+        for rec in merged:
+            c = rec["cloud"]
+            counts[c] = counts.get(c, 0) + 1
+            if counts[c] <= args.limit:
+                trimmed.append(rec)
+        merged = trimmed
+    return merged
 
 
 def norm_url(url: str) -> str:
@@ -627,10 +686,10 @@ def fmt_date(dt: str) -> str:
     return dt[:10]
 
 
-ENGINE_ORDER = ("pansou", "haisou", "yunso", "panxiaozi", "ghspider", "movie", "local")
+ENGINE_ORDER = ("pansou", "haisou", "yunso", "ataw", "panxiaozi", "movie", "local")
 
 # 来源等级（借鉴 PanSou「插件等级」排序维度）：主源 0，补充源依次降级
-ENGINE_RANK = {"pansou": 0, "haisou": 0, "yunso": 0, "local": 0, "panxiaozi": 1, "ghspider": 2, "movie": 2}
+ENGINE_RANK = {"pansou": 0, "haisou": 0, "yunso": 0, "local": 0, "ataw": 1, "panxiaozi": 1, "movie": 2}
 
 
 def kw_hits(rec: dict, kw: str) -> int:
@@ -728,8 +787,8 @@ def build_jobs(args, engines, cloud_types, include, exclude):
         jobs["yunso"] = lambda: search_yunso(args.kw, args.page, args.yunso_mode)
     if "panxiaozi" in engines:
         jobs["panxiaozi"] = lambda: search_panxiaozi(args.kw, args.limit)
-    if "ghspider" in engines:
-        jobs["ghspider"] = lambda: search_ghspider(args.kw)
+    if "ataw" in engines:
+        jobs["ataw"] = lambda: search_ataw(args.kw, args.limit)
     if "movie" in engines:
         jobs["movie"] = lambda: search_movie(args.kw, args.page, args.page_size)
     if "local" in engines:
@@ -830,36 +889,7 @@ def _search_once(args, engines, cloud_types, include, exclude, kw=None, elapsed=
     for name in ENGINE_ORDER:
         merged.extend(by_name.get(name) or [])
 
-    seen = set()
-    items = []
-    for rec in merged:
-        if not pass_filters(rec, include, exclude, cloud_types):
-            continue
-        key = norm_url(rec["url"])
-        if not key or key in seen:
-            continue
-        seen.add(key)
-        items.append(rec)
-
-    # 组内综合排序（借鉴 PanSou 多维排序：关键词匹配度 > 来源等级 > 时间新鲜度）
-    items.sort(key=lambda r: r.get("datetime") or "", reverse=True)
-    items.sort(key=lambda r: (-kw_hits(r, args.kw), ENGINE_RANK.get(r.get("source") or "", 5)))
-
-    # 已确认失效的链接沉底（借鉴 quark-auto-save 失效黑名单思路；不删除，仍展示）
-    dead = load_dead_links()
-    if dead:
-        items.sort(key=lambda r: norm_url(r["url"]) in dead)
-
-    # 每种网盘截断
-    if args.limit > 0:
-        counts = {}
-        trimmed = []
-        for rec in items:
-            c = rec["cloud"]
-            counts[c] = counts.get(c, 0) + 1
-            if counts[c] <= args.limit:
-                trimmed.append(rec)
-        items = trimmed
+    items = finalize_items(merged, args, cloud_types, include, exclude)
     return items, totals, errors
 
 
@@ -896,6 +926,17 @@ def run(args):
                 errors = errors + ["变体「%s」: %s" % (v, e) for e in v_errors]
                 break
 
+    ataw_fallback = False
+    if should_ataw_fallback(engines, items):
+        try:
+            fb_rows, fb_total = search_ataw(args.kw, args.limit)
+            if fb_rows:
+                ataw_fallback = True
+                totals["ataw"] = fb_total
+                items = finalize_items(items + fb_rows, args, cloud_types, include, exclude)
+        except Exception as e:
+            errors.append("ataw(fallback): %s" % e)
+
     errors.sort()
     result = {
         "keyword": args.kw,
@@ -904,6 +945,8 @@ def run(args):
         "errors": errors,
         "results": items,
     }
+    if ataw_fallback:
+        result["ataw_fallback"] = True
     if elapsed:
         result["elapsed"] = elapsed
     if skipped:
@@ -921,6 +964,8 @@ def run(args):
         print(format_text(args.kw, items, errors, totals))
         if variant_used:
             print("（0 结果已自动用变体「%s」重试）" % variant_used)
+        if ataw_fallback:
+            print("（默认源无可用直链，已自动尝试 TA搜 ataw 兜底）")
     return 0 if items or not errors else 1
 
 
@@ -931,7 +976,7 @@ def main():
     p.add_argument("--include", help="结果须含这些词，逗号分隔")
     p.add_argument("--exclude", help="排除这些词，逗号分隔")
     p.add_argument("--src", default="plugin", choices=["all", "tg", "plugin"], help="盘搜数据源，默认 plugin（更快更稳）")
-    p.add_argument("--engine", default="pansou,haisou,yunso", help="pansou,haisou,yunso,panxiaozi,ghspider,movie,local；all=pansou,haisou,yunso（其余引擎需显式指定）")
+    p.add_argument("--engine", default="pansou,haisou,yunso", help="pansou,haisou,yunso,ataw,panxiaozi,movie,local；all=pansou,haisou,yunso（ataw 等需显式指定；默认源无果时脚本会自动 ataw 兜底）")
     p.add_argument("--scope", default="title", choices=["title", "files"], help="海搜范围")
     p.add_argument("--yunso_mode", default="90001", choices=["90001", "90002"], help="小云搜索：90001智能 / 90002精准")
     p.add_argument("--min_size", type=float, help="海搜最小体积 GB")

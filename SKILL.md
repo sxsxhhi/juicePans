@@ -1,19 +1,20 @@
 ---
 name: juicePans
-version: 1.6.2
+version: 1.7.5
 description: >-
   果汁搜盘（英文名 juicePans）：搜索公开网盘影视与资料分享链接（夸克、百度、阿里、迅雷、UC、115、天翼、移动、123、蓝奏、磁力等）。
-  默认并行查询公开盘搜、海搜、小云搜索，去重后智能排序并按网盘分组；可选影视库、自建 PanSou。
+  默认并行查询公开盘搜、海搜、小云搜索，去重后智能排序并按网盘分组；可选 TA搜（ataw）、盘小子、影视库。
+  默认源失败或无可用直链时脚本自动 TA搜 兜底（JSON 可含 ataw_fallback），再交宿主 WebSearch 穷尽公开检索。
   内置引擎熔断、关键词变体兜底重试与 8 类网盘匿名链接核验。
   纯标准库、零依赖；上报前区分「已核验」与「公开检索（未核验）」，不编造链接/提取码/来源。
   只搜不转存：链接须先核验存活并列给用户，经用户批准并指明目标目录后才交夸克转存。
   Use when the user asks 搜网盘、找资源、找电影、找剧、找动漫、搜片、网盘链接、夸克资源、百度网盘、阿里云盘、
-  海搜、盘搜、PanSou、小云搜索、yunso、找下载、提取码, or gives a title and wants share links.
+  海搜、盘搜、PanSou、小云搜索、yunso、TA搜、ataw、找下载、提取码, or gives a title and wants share links.
 ---
 
 # 果汁搜盘 juicePans（网盘资源搜索）
 
-本技能由 Cursor 整合版（1.1.0）与 WorkBuddy 整合版（6 引擎）合并而来，并按 WorkBuddy 沙箱实测调校（沿革见 [整合说明.md](整合说明.md)）。
+本技能由 Cursor 整合版（1.1.0）与 WorkBuddy 整合版合并而来，并按多环境实测调校（沿革见 [整合说明.md](整合说明.md)）。
 脚本相对本技能根目录，纯标准库，不要装 Docker / uv / requests。
 Windows 控制台先设 UTF-8：`$env:PYTHONUTF8=1`；解释器优先 `python`，没有用 `python3`。
 
@@ -21,15 +22,24 @@ Windows 控制台先设 UTF-8：`$env:PYTHONUTF8=1`；解释器优先 `python`�
 
 | 引擎 | 本沙箱 | 说明 |
 |---|---|---|
-| `pansou` 公开盘搜 | ✅ GET 可用 | 公开站 `POST` 会被代理改坏/超时，脚本已**默认 GET 优先**；自建实例（`local`）才先 POST |
+| `pansou` 公开盘搜 | ✅ GET 可用 | 公开站 `POST` 会被代理改坏/超时，脚本已**默认 GET 优先**；TG 频道走 `--src all`（见下） |
 | `yunso` 小云搜索 | ✅ 可用 | JSON 接口 `opensearch.php`（`wd`+`mode`）；直链在 `Data[].Scrurl` |
 | `haisou` 海搜 | ⚠️ 可用但常 429 | 共享出口 IP 限流；单源失败不中断，自动降级 |
+| `ataw` TA搜 | ✅ 可用（v1.7.5） | [so.ataw.top](https://so.ataw.top) SSR 搜索 + 公开详情 API；夸克/阿里/sharepan；**非默认**，但默认三源无果时脚本**自动兜底** |
+| `panxiaozi` 盘小子 | ✅ 可用 | SSR 搜索页 + 详情页直链；来源 [towelong/panxiaozi](https://github.com/towelong/panxiaozi) |
 | `movie` 影视库 | ❌ 502 域名被拦 | `meng-ge.top` 在本沙箱被拦；仅 `--engine movie` 时尝试 |
-| `panxiaozi` 盘小子 | ✅ 可用（v1.3.0 新增） | SSR 搜索页 + 详情页直链；来源 [towelong/panxiaozi](https://github.com/towelong/panxiaozi)；详情页偶发失败会显式报错 |
-| `ghspider` TG 聚合库 | ✅ 可用（v1.3.0 新增） | [netdisk-spider](https://github.com/John-h-netdisk/netdisk-spider) 仓库数据每 6 小时更新；仅百度/夸克，GitHub API 匿名限流 60 次/时 |
-| `local` 自建 PanSou | 取决于是否部署 | 需 `PANSOU_URL` / `NETDISK_API_URL` / 本地 `:8888` |
 
 > 另有 15 个网页搜盘站实测均为 SPA 壳 / Cloudflare / 404，普通 HTTP 拿不到直链，已列黑名单暂不接入——详见 [sources.md](references/sources.md)。
+
+### TG 频道（公开盘搜，非自建）
+
+需要 TG 聚合结果时，用**公开**盘搜并扩大数据源，不要走局域网自建 PanSou：
+
+```text
+python scripts/search.py --kw "片名" --src all
+```
+
+公开盘搜 `--src all` 会较慢，但可覆盖 TG 插件；常见频道包括：`tgsearchers7`、`Quark_Movies`、`yunpanquark`、`QuarkFree`、`guoman4K`、`yunpanx`（以盘搜上游为准，频道可能变动）。
 
 ## 何时用 / 何时不用
 
@@ -44,7 +54,7 @@ Windows 控制台先设 UTF-8：`$env:PYTHONUTF8=1`；解释器优先 `python`�
 1. 抽出关键词（片名优先中文；季/画质/网盘有就带上）。模糊先问清。用户没想好找什么时，可用 `--engine movie` 列影视库热门/4K 榜单当发现入口（借鉴 PanHub 豆瓣榜单思路）。
 2. 在本技能根目录跑搜索脚本。用户指定网盘则加 `--cloud_types`；要 4K、不要预告用 `--include` / `--exclude`。脚本内置三项增强（v1.5.0）：综合排序（关键词匹配度 > 来源等级 > 时间新鲜度）、引擎熔断（连续失败 2 次自动冷却 30 分钟，`--fresh` 强制全跑）、0 结果自动用关键词变体重试一轮。
 3. 把 stdout 按网盘分组给用户。链接必须可点，禁止用代码块包 URL。同一 URL 只出现一次。同组相似候选多时，按「标题匹配 > 命名规范（集数/版本信息全）> 更新时间」把最佳匹配排前（借鉴 mediary-scout）。
-4. 默认三源都失败 → 宿主 WebSearch 常规搜索兜底（总共 ≤5 轮）：关键词 `片名+网盘名`、`片名+提取码`、`片名+pan/夸克/蓝奏`。禁止爬虫/并发抓站，不要去爬 [sources.md](references/sources.md) 黑名单站点；不编造结果。
+4. **兜底顺序（v1.7.5）**：默认三源（`pansou,haisou,yunso`）都失败或**没有可用分享直链** → 脚本**自动**跑 TA搜（`ataw`，软失败不中断；`--json` 时可能含 `ataw_fallback: true`）→ 仍无果再进入 **v1.7.0 全网穷尽**：宿主 WebSearch 多轮不设上限、直抓公开页面提取直链、IMDb/百科别名交叉补搜、GitHub 聚合与 BT/磁力备选；硬约束不变（不爬 [sources.md](references/sources.md) 黑名单、不对单站高频连发、撞登录墙/验证码即止、不编造结果）。
 5. 候选中出现「失效 / 疑似失效」时，自动补搜下一候选替换（自动换链，借鉴 cloud-auto-save-x），不把死链端给用户。
 6. 无结果就如实说，建议换原名/简称，不要凑数。
 
@@ -57,7 +67,9 @@ python scripts/search.py --kw "星际穿越"
 python scripts/search.py --kw "流浪地球2" --cloud_types quark,aliyun --include 4K --exclude 预告,CAM --limit 5
 python scripts/search.py --kw "三体" --engine pansou,yunso
 python scripts/search.py --kw "庆余年" --engine panxiaozi
-python scripts/search.py --kw "庆余年" --engine all,panxiaozi,ghspider --json
+python scripts/search.py --kw "庆余年" --engine ataw --json
+python scripts/search.py --kw "片名" --src all
+python scripts/search.py --kw "庆余年" --engine all,panxiaozi --json
 ```
 
 | 参数 | 说明 |
@@ -65,7 +77,7 @@ python scripts/search.py --kw "庆余年" --engine all,panxiaozi,ghspider --json
 | `--kw` | 必填。海搜还支持 `"精确短语"` 和 `-排除词` |
 | `--cloud_types` | `quark,aliyun,baidu,...`，见 [cloud-types.md](references/cloud-types.md) |
 | `--include` / `--exclude` | 逗号分隔；盘搜可走服务端，其它源本地再滤 |
-| `--engine` | 默认 `pansou,haisou,yunso`。`all` = 这三源。`movie` / `local` / `panxiaozi` / `ghspider` 需显式指定 |
+| `--engine` | 默认 `pansou,haisou,yunso`。`all` = 这三源。`ataw` / `movie` / `panxiaozi` 需显式指定（`ataw` 不在 `all` 内；默认源无果时仍会自动 ataw 兜底） |
 | `--yunso_mode` | `90001` 智能（默认），`90002` 精准 |
 | `--src` | 仅盘搜：默认 `plugin`。`all` 含 TG，较慢 |
 | `--scope` | 仅海搜：`title`（默认）或 `files` |
@@ -76,14 +88,12 @@ python scripts/search.py --kw "庆余年" --engine all,panxiaozi,ghspider --json
 | `--pansou_timeout` | 盘搜超时秒数（默认 45）。公开盘搜是聚合源、天然偏慢（实测 40s+）；急用可调小如 `--pansou_timeout 15`，代价是聚合不全。文本输出含「各源耗时」可定位慢源 |
 | `--fresh` | 忽略引擎熔断状态，强制全部引擎执行 |
 | `--no-variants` | 禁用 0 结果时的关键词变体自动重试 |
-| `--json` | 机器可读 |
+| `--json` | 机器可读（含 `elapsed`、可选 `ataw_fallback`） |
 
 ## 链接核验（本版规则）
 
 - **夸克链接**：优先用夸克 CLI 实测存活；`scripts/check_links.py` 在检测到 `QUARK_SKILL_DIR` + `NODE_BIN` 时自动走夸克 CLI。
 - **其它公开链接（v1.6.0 起内置匿名核验，借鉴 fish2018/NetDiskLinkValidator）**：`check_links.py` 内置夸克（CLI 缺席时的兜底）/阿里/115/123/天翼/百度/蓝奏/UC 八类匿名检测端点，无需 cookie/token；不支持的类型（迅雷/移动/PikPak 等）仍标「未核验」，不假装核验。
-- **自建 PanSou**：`check_links.py` 走 `/api/check/links`（需部署，见下）。
-- **公开盘搜不当检测服务**：不编造有效/失效。本规则修正了早期「全部上报前必核验」的过度承诺——本沙箱对公开站无法可靠实时核验，故以「诚实标注」为准。
 - **四级状态机（v1.4.0 新增，借鉴 supansou/DuPanSou-Archive）**：`check_links.py` 把每次实测结果存本地 JSON（默认 `~/.pan_search/link_state.json`，可用 `--state` / `LINK_STATE_PATH` 改），跨次生效：
   - 状态四级：**有效** / **疑似失效**（首败）/ **确认失效**（连续 2 次失败才判死，防误杀）/ **未核验**
   - 复检策略：有效 72h 内不复检；疑似 30min 内不重复检；失效 12h 后自动复查是否恢复
@@ -150,27 +160,27 @@ cd <夸克网盘skill目录> && node scripts/quark-drive.cjs share-detail --url 
 
 | 变量 | 作用 |
 |---|---|
-| `PANSOU_URL` 或 `NETDISK_API_URL` | 自建盘搜根地址，如 `http://127.0.0.1:8888`（启用 `local` 引擎与链接检测） |
 | `QUARK_SKILL_DIR` / `NODE_BIN` | 夸克 CLI 核验所需；指向夸克网盘 skill 目录与 node 可执行 |
 
-未配置时不要跑 Docker、不要用占位地址。用户明确要求自建：`ghcr.io/fish2018/pansou:latest`，端口 8888，先打 `/api/health`（见 [deploy.sh](scripts/deploy.sh)）。
+未配置时不要跑 Docker、不要用占位地址。
 
 ## 故障（本沙箱实测）
 
 | 现象 | 处理 |
 |---|---|
 | 某一源失败、其它有结果 | 交付有结果的，并注明失败源（脚本已内置，不会中断） |
-| pansou `POST` 超时 / 400 | 脚本对公开站**默认 GET**；仍失败则 `--engine yunso,haisou` |
+| pansou `POST` 超时 / 400 | 脚本对公开站**默认 GET**；仍失败则 `--engine yunso,haisou` 或等 ataw 自动兜底 |
 | 海搜 429 | 连续失败 2 次会熔断冷却 30 分钟自动恢复；急用 `--fresh` 或 `--engine pansou,yunso` |
 | 影视库 502 | `meng-ge.top` 本沙箱被拦；仅 `--engine movie` 时试，失败即跳过 |
+| ataw 单 biz 失败 | 其它 biz 仍返回；全失败时在 `errors` 里见 `ataw(fallback):` |
 | 检测接口 404 / 无服务 | 内置 8 类匿名检测可直接用（夸克/阿里/115/123/天翼/百度/蓝奏/UC）；其余类型不编有效/失效 |
-| 全部失败 | 换关键词（脚本已自动试过去空格/全半角变体）；用宿主 WebSearch 兜底 |
+| 全部失败 | 换关键词（脚本已自动试变体 + ataw）；仍无则 WebSearch 穷尽兜底 |
 
 ## 检查清单
 
 - [ ] 本目录 `scripts/search.py`；Windows 优先 `python`，`$env:PYTHONUTF8=1`
 - [ ] 只搜不转存：未核验的不上报；已核验的也要**等用户批准 + 指明目录**后才转存（见「转存铁律」）
 - [ ] 链接可点，无代码块包 URL，无编造
-- [ ] 多源去重；失败源已说明
+- [ ] 多源去重；失败源已说明；若 JSON 含 `ataw_fallback` 向用户说明已自动 TA搜 兜底
 - [ ] 链接已尽量核验（夸克 CLI / 内置 8 类匿名检测）；不支持的类型标注「未核验」
 - [ ] 违法检索已拒绝
