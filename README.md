@@ -162,7 +162,7 @@ juicePans/
 - [Cp0204/quark-auto-save](https://github.com/Cp0204/quark-auto-save) —— 失效链接沉底与频率风控纪律思路来源；
 - [fancydirty/mediary-scout](https://github.com/fancydirty/mediary-scout) —— 「最佳匹配」展示维度思路来源；
 - [OzoO0/cloud-auto-save-x](https://github.com/OzoO0/cloud-auto-save-x) —— 交付前失效候选自动换链思路来源；
-- 感谢 **Coolapk@周月星斗** 提供更多源
+- 感谢 [**Coolapk@周月星斗**](https://www.coolapk.com/u/31592114) 提供更多源
 
 感谢上述项目的作者们将经验开源共享。
 
