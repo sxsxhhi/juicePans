@@ -7,7 +7,7 @@
 
 纯 Python 标准库的多引擎网盘资源聚合搜索工具 / 通用skill —— 多源并行检索、链接存活核验、四级状态机、零第三方依赖。
 
-### 项目创建者 **Coolapk@sxsxhh** ，邮箱: **sxhxu@foxmail.com** 。欢迎联系加入VX资源分享群
+### 作者邮箱: **sxhxu@foxmail.com** 。欢迎联系加入VX资源分享群
 
 ---
 
