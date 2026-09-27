@@ -149,7 +149,7 @@ juicePans/
 
 - [towelong/panxiaozi](https://github.com/towelong/panxiaozi) —— 盘小子，`panxiaozi` 引擎的来源；
 - [so.ataw.top](https://so.ataw.top) —— TA搜，`ataw` 引擎的数据来源。
-
+- 感谢 [**Coolapk@周月星斗**](https://www.coolapk.com/u/31592114) 提供更多源
 **借鉴设计思路：**
 
 - [fish2018/pansou](https://github.com/fish2018/pansou) —— 公开盘搜聚合上游（`local` 自建引擎），综合排序思路来源；
@@ -162,9 +162,8 @@ juicePans/
 - [Cp0204/quark-auto-save](https://github.com/Cp0204/quark-auto-save) —— 失效链接沉底与频率风控纪律思路来源；
 - [fancydirty/mediary-scout](https://github.com/fancydirty/mediary-scout) —— 「最佳匹配」展示维度思路来源；
 - [OzoO0/cloud-auto-save-x](https://github.com/OzoO0/cloud-auto-save-x) —— 交付前失效候选自动换链思路来源；
-- 感谢 [**Coolapk@周月星斗**](https://www.coolapk.com/u/31592114) 提供更多源
 
-感谢上述项目的作者们将经验开源共享。
+**感谢上述项目的作者们将经验开源共享。**
 
 ## 许可证
 
