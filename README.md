@@ -7,6 +7,7 @@
 
 纯 Python 标准库的多引擎网盘资源聚合搜索工具 / 通用skill —— 多源并行检索、链接存活核验、四级状态机、零第三方依赖。
 
+- 项目创建者 **Coolapk@sxsxhh** ，邮箱: **sxhxu@foxmail.com** 。欢迎联系加入VX资源分享群
 
 ---
 
@@ -161,6 +162,7 @@ juicePans/
 - [Cp0204/quark-auto-save](https://github.com/Cp0204/quark-auto-save) —— 失效链接沉底与频率风控纪律思路来源；
 - [fancydirty/mediary-scout](https://github.com/fancydirty/mediary-scout) —— 「最佳匹配」展示维度思路来源；
 - [OzoO0/cloud-auto-save-x](https://github.com/OzoO0/cloud-auto-save-x) —— 交付前失效候选自动换链思路来源；
+- 感谢 **Coolapk@周月星斗** 提供更多源
 
 感谢上述项目的作者们将经验开源共享。
 
