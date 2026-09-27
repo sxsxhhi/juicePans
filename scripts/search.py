@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""多源网盘资源搜索（仅标准库）。默认：公开盘搜 + 海搜 + 小云搜索；可选 TA搜、盘小子、影视库；默认源无果时自动 ataw 兜底。"""
+"""多源网盘资源搜索（仅标准库）。默认：公开盘搜 + 海搜 + 小云搜索 + TA搜；可选盘小子、影视库。"""
 
 from __future__ import annotations
 
@@ -32,7 +32,7 @@ ATAW_BASE = "https://so.ataw.top"
 ATAW_BIZ = ("quark", "ali", "sharepan")
 ATAW_BIZ_CLOUD = {"quark": "quark", "ali": "aliyun", "sharepan": "others"}
 ATAW_RESOURCE_RE = re.compile(r"/resources/(\d+)\?b=(quark|ali|sharepan)", re.I)
-DEFAULT_ENGINES = frozenset({"pansou", "haisou", "yunso"})
+DEFAULT_ENGINES = frozenset({"pansou", "haisou", "yunso", "ataw"})
 SKILL_VERSION = "1.7.5"
 
 # 引擎熔断状态文件（借鉴 PanSeek「失败插件自动降级」；可用环境变量改路径）
@@ -894,10 +894,10 @@ def _search_once(args, engines, cloud_types, include, exclude, kw=None, elapsed=
 
 
 def run(args):
-    engines = [e.strip() for e in (args.engine or "pansou,haisou,yunso").split(",") if e.strip()]
+    engines = [e.strip() for e in (args.engine or "pansou,haisou,yunso,ataw").split(",") if e.strip()]
     if "all" in engines:
-        # all = 默认三源，且保留同批次显式指定的其它引擎（如 all,panxiaozi）
-        engines = ["pansou", "haisou", "yunso"] + [e for e in engines if e not in ("all", "pansou", "haisou", "yunso")]
+        # all = 默认四源（含 ataw），且保留同批次显式指定的其它引擎（如 all,panxiaozi）
+        engines = ["pansou", "haisou", "yunso", "ataw"] + [e for e in engines if e not in ("all", "pansou", "haisou", "yunso", "ataw")]
     cloud_types = split_csv(args.cloud_types)
     include = split_csv(args.include)
     exclude = split_csv(args.exclude)
@@ -976,7 +976,7 @@ def main():
     p.add_argument("--include", help="结果须含这些词，逗号分隔")
     p.add_argument("--exclude", help="排除这些词，逗号分隔")
     p.add_argument("--src", default="plugin", choices=["all", "tg", "plugin"], help="盘搜数据源，默认 plugin（更快更稳）")
-    p.add_argument("--engine", default="pansou,haisou,yunso", help="pansou,haisou,yunso,ataw,panxiaozi,movie,local；all=pansou,haisou,yunso（ataw 等需显式指定；默认源无果时脚本会自动 ataw 兜底）")
+    p.add_argument("--engine", default="pansou,haisou,yunso,ataw", help="pansou,haisou,yunso,ataw,panxiaozi,movie,local；all=默认四源（含 ataw）；ataw 已是默认引擎，显式排除后默认源无果时仍会自动兜底")
     p.add_argument("--scope", default="title", choices=["title", "files"], help="海搜范围")
     p.add_argument("--yunso_mode", default="90001", choices=["90001", "90002"], help="小云搜索：90001智能 / 90002精准")
     p.add_argument("--min_size", type=float, help="海搜最小体积 GB")

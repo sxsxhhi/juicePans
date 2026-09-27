@@ -1,10 +1,10 @@
 ---
 name: juicePans
-version: 1.7.5
+version: 1.7.6
 description: >-
   果汁搜盘（英文名 juicePans）：搜索公开网盘影视与资料分享链接（夸克、百度、阿里、迅雷、UC、115、天翼、移动、123、蓝奏、磁力等）。
-  默认并行查询公开盘搜、海搜、小云搜索，去重后智能排序并按网盘分组；可选 TA搜（ataw）、盘小子、影视库。
-  默认源失败或无可用直链时脚本自动 TA搜 兜底（JSON 可含 ataw_fallback），再交宿主 WebSearch 穷尽公开检索。
+  默认并行查询公开盘搜、海搜、小云搜索、TA搜（ataw），去重后智能排序并按网盘分组；可选盘小子、影视库。
+  若用户显式排除 ataw 且默认源失败或无可用直链，脚本自动 TA搜 兜底（JSON 可含 ataw_fallback），再交宿主 WebSearch 穷尽公开检索。
   内置引擎熔断、关键词变体兜底重试与 8 类网盘匿名链接核验。
   纯标准库、零依赖；上报前区分「已核验」与「公开检索（未核验）」，不编造链接/提取码/来源。
   只搜不转存：链接须先核验存活并列给用户，经用户批准并指明目标目录后才交夸克转存。
@@ -25,7 +25,7 @@ Windows 控制台先设 UTF-8：`$env:PYTHONUTF8=1`；解释器优先 `python`�
 | `pansou` 公开盘搜 | ✅ GET 可用 | 公开站 `POST` 会被代理改坏/超时，脚本已**默认 GET 优先**；TG 频道走 `--src all`（见下） |
 | `yunso` 小云搜索 | ✅ 可用 | JSON 接口 `opensearch.php`（`wd`+`mode`）；直链在 `Data[].Scrurl` |
 | `haisou` 海搜 | ⚠️ 可用但常 429 | 共享出口 IP 限流；单源失败不中断，自动降级 |
-| `ataw` TA搜 | ✅ 可用（v1.7.5） | [so.ataw.top](https://so.ataw.top) SSR 搜索 + 公开详情 API；夸克/阿里/sharepan；**非默认**，但默认三源无果时脚本**自动兜底** |
+| `ataw` TA搜 | ✅ 可用（v1.7.5 整合，v1.7.6 升为默认） | [so.ataw.top](https://so.ataw.top) SSR 搜索 + 公开详情 API；夸克/阿里/sharepan；**默认引擎**，用户显式排除时默认源无果仍会自动兜底 |
 | `panxiaozi` 盘小子 | ✅ 可用 | SSR 搜索页 + 详情页直链；来源 [towelong/panxiaozi](https://github.com/towelong/panxiaozi) |
 | `movie` 影视库 | ❌ 502 域名被拦 | `meng-ge.top` 在本沙箱被拦；仅 `--engine movie` 时尝试 |
 
@@ -54,7 +54,7 @@ python scripts/search.py --kw "片名" --src all
 1. 抽出关键词（片名优先中文；季/画质/网盘有就带上）。模糊先问清。用户没想好找什么时，可用 `--engine movie` 列影视库热门/4K 榜单当发现入口（借鉴 PanHub 豆瓣榜单思路）。
 2. 在本技能根目录跑搜索脚本。用户指定网盘则加 `--cloud_types`；要 4K、不要预告用 `--include` / `--exclude`。脚本内置三项增强（v1.5.0）：综合排序（关键词匹配度 > 来源等级 > 时间新鲜度）、引擎熔断（连续失败 2 次自动冷却 30 分钟，`--fresh` 强制全跑）、0 结果自动用关键词变体重试一轮。
 3. 把 stdout 按网盘分组给用户。链接必须可点，禁止用代码块包 URL。同一 URL 只出现一次。同组相似候选多时，按「标题匹配 > 命名规范（集数/版本信息全）> 更新时间」把最佳匹配排前（借鉴 mediary-scout）。
-4. **兜底顺序（v1.7.5）**：默认三源（`pansou,haisou,yunso`）都失败或**没有可用分享直链** → 脚本**自动**跑 TA搜（`ataw`，软失败不中断；`--json` 时可能含 `ataw_fallback: true`）→ 仍无果再进入 **v1.7.0 全网穷尽**：宿主 WebSearch 多轮不设上限、直抓公开页面提取直链、IMDb/百科别名交叉补搜、GitHub 聚合与 BT/磁力备选；硬约束不变（不爬 [sources.md](references/sources.md) 黑名单、不对单站高频连发、撞登录墙/验证码即止、不编造结果）。
+4. **引擎顺序（v1.7.6）**：默认四源 `pansou,haisou,yunso,ataw` **第一轮并行**（ataw 软失败不中断）；若用户显式排除 ataw 且默认三源无可用分享直链 → 脚本自动补跑 TA搜（`--json` 时含 `ataw_fallback: true`）→ 仍无果再进入 **v1.7.0 全网穷尽**：宿主 WebSearch 多轮不设上限、直抓公开页面提取直链、IMDb/百科别名交叉补搜、GitHub 聚合与 BT/磁力备选；硬约束不变（不爬 [sources.md](references/sources.md) 黑名单、不对单站高频连发、撞登录墙/验证码即止、不编造结果）。
 5. 候选中出现「失效 / 疑似失效」时，自动补搜下一候选替换（自动换链，借鉴 cloud-auto-save-x），不把死链端给用户。
 6. 无结果就如实说，建议换原名/简称，不要凑数。
 
@@ -77,7 +77,7 @@ python scripts/search.py --kw "庆余年" --engine all,panxiaozi --json
 | `--kw` | 必填。海搜还支持 `"精确短语"` 和 `-排除词` |
 | `--cloud_types` | `quark,aliyun,baidu,...`，见 [cloud-types.md](references/cloud-types.md) |
 | `--include` / `--exclude` | 逗号分隔；盘搜可走服务端，其它源本地再滤 |
-| `--engine` | 默认 `pansou,haisou,yunso`。`all` = 这三源。`ataw` / `movie` / `panxiaozi` 需显式指定（`ataw` 不在 `all` 内；默认源无果时仍会自动 ataw 兜底） |
+| `--engine` | 默认 `pansou,haisou,yunso,ataw`。`all` = 这四源。`movie` / `panxiaozi` 需显式指定；显式排除 ataw 且默认源无果时仍会自动兜底 |
 | `--yunso_mode` | `90001` 智能（默认），`90002` 精准 |
 | `--src` | 仅盘搜：默认 `plugin`。`all` 含 TG，较慢 |
 | `--scope` | 仅海搜：`title`（默认）或 `files` |
@@ -169,10 +169,10 @@ cd <夸克网盘skill目录> && node scripts/quark-drive.cjs share-detail --url 
 | 现象 | 处理 |
 |---|---|
 | 某一源失败、其它有结果 | 交付有结果的，并注明失败源（脚本已内置，不会中断） |
-| pansou `POST` 超时 / 400 | 脚本对公开站**默认 GET**；仍失败则 `--engine yunso,haisou` 或等 ataw 自动兜底 |
+| pansou `POST` 超时 / 400 | 脚本对公开站**默认 GET**；仍失败则其余默认源（含 ataw）照常返回结果 |
 | 海搜 429 | 连续失败 2 次会熔断冷却 30 分钟自动恢复；急用 `--fresh` 或 `--engine pansou,yunso` |
 | 影视库 502 | `meng-ge.top` 本沙箱被拦；仅 `--engine movie` 时试，失败即跳过 |
-| ataw 单 biz 失败 | 其它 biz 仍返回；全失败时在 `errors` 里见 `ataw(fallback):` |
+| ataw 单 biz 失败 | 其它 biz 仍返回；显式排除 ataw 的调用全失败时在 `errors` 里见 `ataw(fallback):` |
 | 检测接口 404 / 无服务 | 内置 8 类匿名检测可直接用（夸克/阿里/115/123/天翼/百度/蓝奏/UC）；其余类型不编有效/失效 |
 | 全部失败 | 换关键词（脚本已自动试变体 + ataw）；仍无则 WebSearch 穷尽兜底 |
 

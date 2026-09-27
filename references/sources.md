@@ -9,13 +9,13 @@
 | `pansou` | 是 | `https://so.252035.xyz/api/search` | 公开盘搜；公开站先 GET（有 include/exclude 时先 POST）。TG：`--src all` | ✅ GET 可用 |
 | `haisou` | 是 | `https://haisou.cc/api/v2/shares/search` | 不要传 `platforms:["all"]`（会 422） | ⚠️ 可用但常 429 |
 | `yunso` | 是 | `https://www.yunso.net/api/opensearch.php` | `wd` + `mode`（90001 智能 / 90002 精准） | ✅ 可用 |
-| `ataw` | 否（自动兜底） | `https://so.ataw.top` | TA搜：SSR `/?q=&b=`（`b`=quark/ali/sharepan）→ `GET /api/v1/public/resources/{id}` 取直链；来源标签如 `ataw:quark`；单 biz 软失败（v1.7.5） | ✅ 可用 |
+| `ataw` | **是（默认，v1.7.6）** | `https://so.ataw.top` | TA搜：SSR `/?q=&b=`（`b`=quark/ali/sharepan）→ `GET /api/v1/public/resources/{id}` 取直链；来源标签如 `ataw:quark`；单 biz 软失败（v1.7.5 整合） | ✅ 可用 |
 | `panxiaozi` | 否 | `https://pan.xiaozi.cc/resource?q=<kw>` | 盘小子 SSR + 详情直链 | ✅ 可用 |
 | `movie` | 否 | `https://meng-ge.top/api/movieData/getMoviesByType` | 影视库；需 `--engine movie` | ❌ 502（部分环境被拦） |
 
-`--engine all` = **`pansou,haisou,yunso` 仅此三源**（不含 `ataw` / `movie` / `panxiaozi`）。
+`--engine all` = **`pansou,haisou,yunso,ataw` 默认四源**（不含 `movie` / `panxiaozi`）。
 
-默认三源失败或无可用分享直链时，脚本会在 Agent WebSearch 之前**自动**尝试 `ataw`（JSON 可含 `ataw_fallback`）。手动：`--engine ataw`。
+用户显式排除 `ataw` 且默认三源无可用分享直链时，脚本会在 Agent WebSearch 之前**自动**补搜 `ataw`（JSON 可含 `ataw_fallback`）。默认调用下 ataw 已在第一轮运行。
 
 ### TG 频道（公开盘搜 `--src all`）
 
