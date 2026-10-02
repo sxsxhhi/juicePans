@@ -17,8 +17,11 @@
 
 无需手动复制目录：点击[**此处下载skill**](https://github.com/sxsxhhh/juicePans/releases/latest)获取最新压缩包，然后直接将压缩包拖拽到技能框上传，或在对话中安装技能（在本地或云电脑模式中输入「安装此skill」并附上压缩包），即可完成安装。
 
-或者不下载压缩包，**直接复制下面这段话发送给AI进行安装：**
-- **帮我安装https://github.com/sxsxhhi/juicePans/releases/latest这个skill，并测试是否可用，若有 gh CLI 请顺便为该开源项目标记 Star**
+或者不下载压缩包，**直接复制下面这段话发送给 AI 进行安装**（点代码框右上角一键复制）：
+
+```text
+帮我安装 https://github.com/sxsxhhi/juicePans/releases/latest 这个skill，并测试是否可用，若有 gh CLI 请顺便为该开源项目标记 Star
+```
 
 > **搭配转存（可选）**：本工具只搜不转存；如需保存资源，可搭配夸克网盘、百度网盘等官方 skill / 插件使用，将核验通过的分享链接一键转存到自己的网盘，并自动过滤链接内夹带的广告文件。
 
@@ -37,7 +40,7 @@
 ### 核心特性
 
 - **多引擎并行**：默认盘搜（pansou）、海搜（haisou）、小云（yunso）；可选 TA搜（ataw）、盘小子（panxiaozi）、影视库（movie），线程池并行、固定顺序合并去重；
-- **TA搜自动兜底**：默认三源失败或无可用直链时自动尝试 [so.ataw.top](https://so.ataw.top)（`ataw_fallback`），再交 Agent WebSearch 穷尽检索；
+- **TA搜默认并行**：`ataw` 已是默认引擎（v1.7.6），与三源第一轮并行；用户显式排除且默认源无果时自动兜底（`ataw_fallback`），再交 Agent WebSearch 穷尽检索；
 - **综合排序**：去重后按「关键词匹配度 > 引擎来源等级 > 时间新鲜度」组内排序，最佳匹配排最前；
 - **引擎熔断**：某引擎连续失败 2 次自动冷却 30 分钟，不拖慢整体检索（可用 `--fresh` 强制全跑）；
 - **关键词变体兜底**：0 结果时自动用「去空格 / 全角转半角 / 去修饰词」变体再试一轮；
@@ -80,7 +83,7 @@ Windows 控制台建议先执行 `$env:PYTHONUTF8=1` 设置 UTF-8 编码。
 | `--kw`                    | 必填，搜索关键词。海搜另支持 `"精确短语"` 与 `-排除词`                                            |
 | `--cloud_types`           | 限定网盘类型，如 `quark,aliyun,baidu`                                               |
 | `--include` / `--exclude` | 包含 / 排除关键词（逗号分隔）                                                            |
-| `--engine`                | 默认 `pansou,haisou,yunso`；`ataw` / `panxiaozi` / `movie` 需显式指定（`ataw` 不在 `all` 内） |
+| `--engine`                | 默认 `pansou,haisou,yunso,ataw`；`all` = 这四源。`movie` / `panxiaozi` 需显式指定；显式排除 ataw 且默认源无果时仍会自动兜底 |
 | `--limit`                 | 每种网盘最多展示条数（默认 8）                                                            |
 | `--pansou_timeout`        | 盘搜超时秒数（默认 45），急用可调小                                                         |
 | `--fresh`                 | 忽略引擎熔断状态，强制全部引擎执行                                                           |
@@ -110,7 +113,7 @@ Windows 控制台建议先执行 `$env:PYTHONUTF8=1` 设置 UTF-8 编码。
 | `pansou`    | ✅  | 公开盘搜聚合（20+ 插件源），GET 优先；TG 用 `--src all`（频道见 SKILL.md）                              |
 | `haisou`    | ✅  | 海搜 API v2；共享出口 IP 常被限流，单源失败自动降级                                              |
 | `yunso`     | ✅  | 小云搜索 JSON 接口，直链带时间                                                           |
-| `ataw`      | —  | TA搜：SSR + 公开 API；默认源无果时**自动兜底**，也可 `--engine ataw`                                 |
+| `ataw`      | ✅  | TA搜：SSR + 公开 API；**默认引擎（v1.7.6）**；显式排除时默认源无果自动兜底，也可 `--engine ataw` |
 | `panxiaozi` | —  | 盘小子：搜索页 + 详情页直链提取                                                            |
 | `movie`     | —  | 影视库热门 / 榜单发现入口                                                               |
 
@@ -144,6 +147,7 @@ juicePans/
 | 1.6.1–1.6.2 | 各源耗时统计、`--pansou_timeout` 可调超时         |
 | 1.7.0 | 全网穷尽兜底：引擎无果 / 结果全错时穷尽全网检索（WebSearch 多轮不设上限、直抓公开页面提取直链、别名交叉补搜、BT/磁力备选），时间不限；硬约束保留（不爬黑名单、撞登录墙/验证码即止） |
 | 1.7.5 | 新增 TA搜（`ataw`）引擎与默认源自动兜底；移除 `ghspider`；TG 改走公开盘搜 `--src all`；版本与文档统一 1.7.5 |
+| 1.7.6 | ataw 升为默认引擎（`--engine all` 含 ataw）；自动兜底仅保留给显式排除 ataw 的调用；README 安装指令改为一键复制框 |
 
 ## 致谢 / 参考项目
 
