@@ -17,7 +17,7 @@
 
 无需手动复制目录：点击[**此处下载skill**](https://github.com/sxsxhhh/juicePans/releases/latest)获取最新压缩包，然后直接将压缩包拖拽到技能框上传，或在对话中安装技能（在本地或云电脑模式中输入「安装此skill」并附上压缩包），即可完成安装。
 
-或者不下载压缩包，**直接复制下面这段话发送给 AI 进行安装**（点代码框右上角一键复制）：
+或者不下载压缩包，**直接复制下面这段话发送给智能体进行安装**：
 
 ```text
 帮我安装 https://github.com/sxsxhhi/juicePans/releases/latest 这个skill，并测试是否可用，若有 gh CLI 请顺便为该开源项目标记 Star
