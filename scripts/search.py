@@ -1,11 +1,16 @@
 #!/usr/bin/env python3
-"""多源网盘资源搜索（仅标准库）。默认：公开盘搜 + 海搜 + 小云搜索 + TA搜；可选盘小子、影视库。"""
+"""多源网盘资源搜索（仅标准库）。默认：公开盘搜 + 海搜 + 小云搜索 + TA搜；可选盘小子、影视库。
+
+v1.7.7：--from_url 公开页面直链提取、--suggest_queries 站内检索建议、风控熔断（429/412/验证码页一次即熔断，403 按普通失败计）、同站详情限流。"""
 
 from __future__ import annotations
 
 import argparse
+import html as html_lib
 import json
+import math
 import os
+import random
 import re
 import ssl
 import sys
@@ -14,7 +19,8 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
+from email.utils import parsedate_to_datetime
 
 if hasattr(sys.stdout, "reconfigure"):
     try:
@@ -33,13 +39,22 @@ ATAW_BIZ = ("quark", "ali", "sharepan")
 ATAW_BIZ_CLOUD = {"quark": "quark", "ali": "aliyun", "sharepan": "others"}
 ATAW_RESOURCE_RE = re.compile(r"/resources/(\d+)\?b=(quark|ali|sharepan)", re.I)
 DEFAULT_ENGINES = frozenset({"pansou", "haisou", "yunso", "ataw"})
-SKILL_VERSION = "1.7.5"
+SKILL_VERSION = "1.7.7"
 
 # 引擎熔断状态文件（借鉴 PanSeek「失败插件自动降级」；可用环境变量改路径）
 ENGINE_STATE_PATH = os.environ.get("ENGINE_STATE_PATH") or os.path.expanduser("~/.pan_search/engine_state.json")
 LINK_STATE_PATH = os.environ.get("LINK_STATE_PATH") or os.path.expanduser("~/.pan_search/link_state.json")
 ENGINE_FAIL_LIMIT = 2    # 连续失败次数达到即冷却
 ENGINE_COOLDOWN_MIN = 30  # 冷却时长（分钟）
+# v1.7.7 风控熔断：HTTP 429/412 或验证码页（强风控）→ 一次即冷却 RISK_COOLDOWN_MIN 分钟（Retry-After 更长则从其，上限 24h）；
+# HTTP 403 归为弱风控：仍按普通失败「连续 2 次 / 30 分钟」计数（403 也可能是 CDN 瞬时/配置问题），但本轮不再参与变体重试。
+RISK_COOLDOWN_MIN = 30
+RISK_COOLDOWN_MAX_MIN = 24 * 60
+RISK_HTTP_CODES = (403, 412, 429)
+RISK_STRONG_HTTP_CODES = (412, 429)
+# 同站详情页抓取：并发上限与随机间隔（秒）
+DETAIL_WORKERS = 2
+DETAIL_DELAY = (0.2, 0.8)
 
 # 对外一律用盘搜口径的网盘标识（canon_type 已归一，故此处只保留规范键）
 CLOUD_NAMES = {
@@ -180,6 +195,64 @@ def ssl_context(insecure: bool) -> ssl.SSLContext:
     return ctx
 
 
+class RiskControlError(RuntimeError):
+    """风控类错误（HTTP 429/412/403 或验证码/人机验证页）。仍是 RuntimeError，调用方无感。
+    strong=True（429/412/验证码）一次即熔断；strong=False（403）按普通失败计数。"""
+
+    def __init__(self, msg: str, retry_after: int = 0, strong: bool = True):
+        super().__init__(msg)
+        self.retry_after = int(retry_after or 0)
+        self.strong = bool(strong)
+
+
+RETRY_AFTER_MAX_SEC = 7 * 24 * 3600  # 解析上限（熔断时长另有 RISK_COOLDOWN_MAX_MIN 封顶）
+
+
+def parse_retry_after(val) -> int:
+    """Retry-After：秒数或 HTTP 日期 → 秒；无法解析返回 0。"""
+    v = (val or "").strip() if isinstance(val, str) else ""
+    if not v:
+        return 0
+    if re.fullmatch(r"[0-9]+", v):  # 只认 ASCII 数字（str.isdigit 会放行「²」等导致 int() 抛错）
+        return min(int(v), RETRY_AFTER_MAX_SEC) if len(v) <= 12 else RETRY_AFTER_MAX_SEC
+    try:
+        dt = parsedate_to_datetime(v)
+        if dt is None:
+            return 0
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return min(RETRY_AFTER_MAX_SEC, max(0, int((dt - datetime.now(timezone.utc)).total_seconds())))
+    except (TypeError, ValueError, IndexError, OverflowError):
+        return 0
+
+
+# 标题须以验证类字样**开头**（如「验证码_哔哩哔哩」「百度安全验证」「Just a moment...」）；
+# 搜索页常把关键词回显进标题（如盘小子「“验证码”搜索结果 - 盘小子」），故不做标题内任意位置匹配。
+_CAPTCHA_TITLE_RE = re.compile(
+    r"<title[^>]*>\s*(?:安全验证|人机验证|验证码|访问验证|百度安全验证|captcha|just a moment|attention required)", re.I)
+_CAPTCHA_MARKERS = (
+    "wappass.baidu.com/static/captcha", "/account/unhuman",
+    "sec.douban.com/", "cf_chl_opt", "cf-browser-verification",
+)
+
+
+def looks_like_captcha(text: str) -> bool:
+    """保守判定验证码/人机验证页：只看小页面的 <title> 开头与少量强特征（URL/脚本标识），避免误伤正常页与关键词回显。"""
+    t = text or ""
+    if len(t) > 60000:
+        return False
+    if any(m in t for m in _CAPTCHA_MARKERS):
+        return True
+    return bool(_CAPTCHA_TITLE_RE.search(t))
+
+
+def _http_error(e: urllib.error.HTTPError, msg: str) -> RuntimeError:
+    if e.code in RISK_HTTP_CODES:
+        ra = parse_retry_after(e.headers.get("Retry-After") if e.headers else "")
+        return RiskControlError(msg, ra, strong=e.code in RISK_STRONG_HTTP_CODES)
+    return RuntimeError(msg)
+
+
 def http_json(url: str, *, method="GET", body=None, timeout=45, insecure=False, headers=None):
     """请求 JSON。SSL 先正常校验，失败再降级一次（不全程关校验）。"""
     data = None if body is None else json.dumps(body, ensure_ascii=False).encode("utf-8")
@@ -196,7 +269,12 @@ def http_json(url: str, *, method="GET", body=None, timeout=45, insecure=False, 
     def _open(ctx):
         with urllib.request.urlopen(req, context=ctx, timeout=timeout) as resp:
             raw = resp.read().decode("utf-8", errors="replace")
-            return json.loads(raw)
+            try:
+                return json.loads(raw)
+            except json.JSONDecodeError:
+                if looks_like_captcha(raw):
+                    raise RiskControlError("验证码/人机验证页面（风控）")
+                raise
 
     try:
         return _open(ssl_context(insecure))
@@ -207,8 +285,12 @@ def http_json(url: str, *, method="GET", body=None, timeout=45, insecure=False, 
     except TimeoutError as e:
         raise RuntimeError("请求超时") from e
     except urllib.error.HTTPError as e:
-        detail = e.read().decode("utf-8", errors="replace")[:400]
-        raise RuntimeError("HTTP %s %s: %s" % (e.code, e.reason, detail)) from e
+        try:
+            body = e.read(8192)  # 只读开头：海搜 429 响应体实测约 20MB（debug 字段），全读纯浪费
+        except Exception:
+            body = b""
+        detail = body.decode("utf-8", errors="replace")[:400]
+        raise _http_error(e, "HTTP %s %s: %s" % (e.code, e.reason, detail)) from e
     except json.JSONDecodeError as e:
         raise RuntimeError("非 JSON 响应") from e
 
@@ -223,7 +305,10 @@ def http_html(url: str, timeout=30, insecure=False, retries=1):
 
     def _open(ctx):
         with urllib.request.urlopen(req, context=ctx, timeout=timeout) as resp:
-            return resp.read().decode("utf-8", errors="replace")
+            text = resp.read().decode("utf-8", errors="replace")
+        if looks_like_captcha(text):
+            raise RiskControlError("验证码/人机验证页面（风控）")
+        return text
 
     last_net_err = None
     for attempt in range(retries + 1):
@@ -234,7 +319,7 @@ def http_html(url: str, timeout=30, insecure=False, retries=1):
                 raise
             return _open(ssl_context(True))
         except urllib.error.HTTPError as e:
-            raise RuntimeError("HTTP %s %s" % (e.code, e.reason)) from e
+            raise _http_error(e, "HTTP %s %s" % (e.code, e.reason)) from e
         except (urllib.error.URLError, TimeoutError, OSError) as e:  # 网络类异常：退避后重试
             last_net_err = e
             if attempt < retries:
@@ -266,6 +351,279 @@ def is_share_url(u: str) -> bool:
     if u.lower().startswith(("magnet:", "ed2k:")):
         return True
     return bool(re.search(r"/s/|/t/|/w/i/|/share", u, re.I))
+
+
+# ---- v1.7.7 文本直链提取（独立实现）：全角转半角、可无协议头、逐链就近配对提取码 ----
+_FW_TRANS = str.maketrans({**{chr(0xFF01 + i): chr(0x21 + i) for i in range(94)}, "\u3000": " "})
+
+
+def to_halfwidth(text: str) -> str:
+    return (text or "").translate(_FW_TRANS)
+
+
+# 各网盘「主机 + 分享路径」形态（必须带分享路径，主站入口/个人页不算）
+_SHARE_HOSTPATH = (
+    r"pan\.quark\.cn/s/[0-9A-Za-z]+",
+    r"pan\.baidu\.com/(?:s/[0-9A-Za-z_\-]+|share/init\?surl=[0-9A-Za-z_\-]+)",
+    r"(?:www\.)?(?:alipan|aliyundrive)\.com/s/[0-9A-Za-z]+",
+    r"pan\.xunlei\.com/s/[0-9A-Za-z_\-]+",
+    r"(?:drive|fast)\.uc\.cn/s/[0-9A-Za-z]+",
+    r"(?:www\.)?(?:115|115cdn|anxia)\.com/s/[0-9A-Za-z]+",
+    r"(?:h5\.)?cloud\.189\.cn/(?:t/[0-9A-Za-z]+|web/share\?code=[0-9A-Za-z]+|share\.html#/t/[0-9A-Za-z]+)",
+    r"(?:yun|caiyun)\.139\.com/(?:shareweb/#/w/i/|w/i/|m/i\?)[0-9A-Za-z]+",
+    r"(?:www\.)?(?:123pan\.com|123pan\.cn|123912\.com|123684\.com|123865\.com)/s/[0-9A-Za-z_\-]+",
+    r"(?:[0-9A-Za-z\-]+\.)?(?:lanzou[a-z]?|lanzn)\.com/(?:tp/)?(?!u/)[0-9A-Za-z_]{5,}",
+    r"(?:www\.)?mypikpak\.com/s/[0-9A-Za-z_\-]+",
+)
+SHARE_LINK_RE = re.compile(
+    r"(?:(?:https?:)?//|(?<![A-Za-z0-9\-.@/]))(?:" + "|".join(_SHARE_HOSTPATH) + r")(?:[?#/&][A-Za-z0-9\-._~/?#=&%+]*)?"
+    r"|magnet:\?xt=urn:btih:[0-9A-Za-z]{32,40}(?:&[A-Za-z0-9._]+=[A-Za-z0-9._%+\-:/]*)*",
+    re.I,
+)
+_PWD_RE = re.compile(
+    r"(?:提取码|提取密码|访问码|访问密码|分享码|密码|口令|(?<![A-Za-z])(?:pwd|passcode|password|code)(?![A-Za-z]))"
+    r"\s*[\]】)」>]?\s*(?:[:=]|是|为)?\s*[\[【(「<]?\s*([A-Za-z0-9]{3,8})(?![A-Za-z0-9])",
+    re.I,
+)
+PWD_WINDOW = 40  # 链接后多少字符内找提取码（且不越过下一条链接）
+# 「(访问码: abcd): URL」式前置提取码：码后紧跟冒号再接链接，才认作该链接的码（无冒号/有「链接」字样时仍按链接后配对）
+_PWD_PRE_RE = re.compile(_PWD_RE.pattern + r"\s*[\]】)」>]?\s*:\s*$", re.I)
+_PWD_PRE_GAP_RE = re.compile(r"\s*[\]】)」>]?\s*:\s*$")
+
+
+def _link_key(u: str) -> str:
+    low = (u or "").strip()
+    if low.lower().startswith("magnet:"):
+        m = re.search(r"btih:([0-9A-Za-z]+)", low, re.I)
+        return "magnet:" + (m.group(1).lower() if m else low.lower())
+    low = re.sub(r"^(?:https?:)?//", "", low, flags=re.I)
+    host, _, rest = low.partition("/")
+    if "#" in rest and not re.search(r"139\.com|189\.cn", host, re.I):
+        rest = rest.split("#", 1)[0]  # 夸克 #/list/share 等纯前端锚点不影响去重；移动/天翼的 # 是路径一部分
+    rest = re.sub(r"(?:(?<=[?&])|^)(?:pwd|password|passcode)=[^&#]*&?", "", rest, flags=re.I)
+    return host.lower() + "/" + rest.rstrip("/?&#")
+
+
+def links_from_text(text: str) -> list[tuple[str, str]]:
+    """从任意文本提取网盘分享链接 → [(url, pwd)]。
+    全角转半角；识别带/不带 http(s) 的分享链接与磁力；截掉尾随标点/中文；
+    提取码优先取 URL 的 pwd=/password=，否则取链接后 PWD_WINDOW 字符内最近的「提取码/密码/访问码/pwd/code」，
+    且不越过下一条链接（逐链就近配对，不是全文共用一个码）；按规范化链接去重。"""
+    return [(u, pwd) for u, pwd, _ in _scan_links(to_halfwidth(text))]
+
+
+def _scan_links(t: str) -> list[tuple[str, str, int]]:
+    """links_from_text 的核心（输入须已转半角，长度与原文逐字对应）→ [(url, pwd, 首次出现位置)]。"""
+    spans = []
+    for m in SHARE_LINK_RE.finditer(t):
+        u = m.group(0)
+        amp = u.find("&")
+        if amp > 0 and "?" not in u[:amp] and not u.lower().startswith("magnet:"):
+            u = u[:amp]  # 无 ? 的 & 不是查询串（多为 HTML/JSON 残留）
+        u = u.rstrip(".?&#=/~")
+        if u:
+            spans.append((m.start(), m.start() + len(u), u))
+    out: list[tuple[str, str, int]] = []
+    index: dict[str, int] = {}
+    consumed = 0  # 上一条链接（含其已配对提取码）在文本中的结束位置；前置提取码不得越过它
+    for i, (start, end, u) in enumerate(spans):
+        if u.startswith("//"):
+            u = "https:" + u  # 协议相对链接 //pan.quark.cn/s/...
+        elif not u.lower().startswith(("http://", "https://", "magnet:")):
+            u = "https://" + u
+        u, pwd = clean_share_url(u)
+        link_end = end
+        if not pwd:
+            pre = _PWD_PRE_RE.search(t[max(consumed, start - PWD_WINDOW):start])
+            if pre:
+                pwd = pre.group(1)
+        if not pwd:
+            nxt = spans[i + 1][0] if i + 1 < len(spans) else None
+            stop = nxt if nxt is not None else len(t)
+            pm = _PWD_RE.search(t[end:min(stop, end + PWD_WINDOW)])
+            # 码后紧跟冒号再接下一条链接 → 那是下一条的前置码，不归本条（避免把下一条的码错配给本条）
+            if pm and not (nxt is not None and _PWD_PRE_GAP_RE.fullmatch(t[end + pm.end():nxt])):
+                pwd = pm.group(1)
+                end = end + pm.end()
+        consumed = max(consumed, end)
+        end = link_end
+        key = _link_key(u)
+        if key in index:
+            j = index[key]
+            if pwd and not out[j][1]:
+                out[j] = (out[j][0], pwd, out[j][2])
+            continue
+        index[key] = len(out)
+        out.append((u, pwd, start))
+    return out
+
+
+# ---- v1.7.7 --from_url：公开页面直链提取 ----
+PAGE_MAX_URLS = 5
+PAGE_MAX_LINKS = 100
+PAGE_DELAY = (0.5, 1.5)
+PAGE_SITES = (
+    ("bilibili.com", "bilibili"), ("b23.tv", "bilibili"), ("tieba.baidu.com", "tieba"),
+    ("zhihu.com", "zhihu"), ("douban.com", "douban"),
+)
+_WALL_TITLE_RE = re.compile(r"<title[^>]*>[^<]{0,80}?(登录|登陆|sign ?in|log ?in|禁止访问|access denied|forbidden)", re.I)
+_WALL_TEXT = ("登录后查看", "登录后可见", "请先登录", "登录查看完整", "回复后可见")
+SUGGEST_SITES = ("bilibili.com/opus", "bilibili.com/read", "tieba.baidu.com", "zhihu.com", "douban.com/group")
+SUGGEST_TERMS = ("夸克 网盘", "pan.quark.cn")
+
+
+def page_site(url: str) -> tuple[str, str]:
+    host = (urllib.parse.urlsplit(url).netloc or "").lower().split(":")[0]
+    if host.startswith("www."):
+        host = host[4:]
+    for suffix, name in PAGE_SITES:
+        if host == suffix or host.endswith("." + suffix):
+            return name, "page:" + name
+    return host or "unknown", "page:" + (host or "unknown")
+
+
+def unescape_page(src: str) -> str:
+    """页面源码解码：JSON 转义（\\u002F、\\/）、HTML 实体、跳转包装里 URL 编码的目标链接。"""
+    t = src or ""
+    t = re.sub(r"\\u([0-9a-fA-F]{4})", lambda m: chr(int(m.group(1), 16)), t)
+    if re.search("[\ud800-\udfff]", t):  # \uD83D\uDE00 这类代理对合并成真字符，孤立代理替换掉
+        t = t.encode("utf-16", "surrogatepass").decode("utf-16", "replace")
+    t = t.replace("\\/", "/")
+    t = html_lib.unescape(t)
+    t = re.sub(r"https?%3A(?:%2F|/){2}[^\s\"'<>]+",
+               lambda m: urllib.parse.unquote(m.group(0)), t, flags=re.I)
+    return t
+
+
+def page_title(src: str) -> str:
+    m = re.search(r'<meta[^>]+property=["\']og:title["\'][^>]+content=["\']([^"\']+)', src or "", re.I)
+    if not m:
+        m = re.search(r"<title[^>]*>(.*?)</title>", src or "", re.I | re.S)
+    return re.sub(r"\s+", " ", html_lib.unescape(m.group(1))).strip()[:80] if m else ""
+
+
+def page_wall(src: str) -> str:
+    """登录墙/验证码判定（仅在页面未提取到链接时用于停站）。"""
+    if looks_like_captcha(src):
+        return "验证码/人机验证页"
+    if _WALL_TITLE_RE.search(src or ""):
+        return "登录墙/访问受限页"
+    if any(w in (src or "") for w in _WALL_TEXT):
+        return "正文需登录/回复后可见"
+    return ""
+
+
+def extract_page_links(src: str) -> list[tuple[str, str, str]]:
+    """页面 → [(url, pwd, context)]：先在去标签正文里配对提取码，再补源码属性（href/JSON）里的链接。"""
+    dec = unescape_page(src)
+    body_hw = to_halfwidth(re.sub(r"<[^>]+>", " ", dec))
+    out: list[tuple[str, str, str]] = []
+    index: dict[str, int] = {}
+    for is_body, part in ((True, body_hw), (False, to_halfwidth(dec))):
+        for u, pwd, pos in _scan_links(part):
+            key = _link_key(u)
+            if key in index:
+                j = index[key]
+                if pwd and not out[j][1]:
+                    out[j] = (out[j][0], pwd, out[j][2])
+                continue
+            # 上下文按正文中的**实际位置**取（旧实现按 URL 前缀 find，磁力/share/init 链会全部拿到第一条的上下文）
+            ctx = _link_context(body_hw, pos) if is_body else ""
+            index[key] = len(out)
+            out.append((u, pwd, ctx))
+    return out
+
+
+def _link_context(body: str, pos: int) -> str:
+    if pos <= 0:
+        return ""
+    ctx = re.sub(r"\s+", " ", body[max(0, pos - 80):pos])
+    ctx = SHARE_LINK_RE.split(ctx)[-1]  # 不跨过上一条链接
+    ctx = _PWD_RE.sub(" ", ctx)  # 去掉上一条链接的提取码
+    ctx = re.split(r"[\"'{}\[\]<>=]", ctx)[-1]  # 去掉脚本/JSON 残片
+    ctx = re.sub(r"(?:https?:)?/*$", "", ctx.strip()).strip()[-40:].strip(" \"'{}[]:,;")
+    if re.fullmatch(r"[\w.:/?&#%\-]*", ctx, re.A):
+        return ""  # 只剩标识符/URL 残片，不算正文
+    return ctx
+
+
+def page_cloud(u: str) -> str:
+    c = cloud_from_url(u)
+    if c == "others":
+        if re.search(r"lanzn\.com", u, re.I):
+            return "lanzou"
+        if re.search(r"123pan\.cn", u, re.I):
+            return "123"
+    return c
+
+
+def collect_pages(args, urls, cloud_types, include, exclude):
+    """串行抓取公开页面（同站 0.5–1.5s 随机间隔；撞登录墙/验证码即停该站），返回 (items, pages, errors, totals)。"""
+    errors, rows, pages, totals = [], [], [], {}
+    urls = list(dict.fromkeys(u.strip() for u in urls if u.strip()))  # 去重保序
+    if len(urls) > PAGE_MAX_URLS:
+        errors.append("from_url: 单次最多 %d 个页面，已忽略其余 %d 个" % (PAGE_MAX_URLS, len(urls) - PAGE_MAX_URLS))
+        urls = urls[:PAGE_MAX_URLS]
+    visited, stopped = set(), {}
+    for u in urls:
+        if not re.match(r"https?://", u, re.I):
+            u = "https://" + u
+        site, label = page_site(u)
+        info = {"url": u, "site": site, "source": label, "status": "", "links": 0, "title": ""}
+        pages.append(info)
+        if site in stopped:
+            info["status"] = "skipped"
+            info["error"] = "同站已撞%s，本次停止该站" % stopped[site]
+            errors.append("%s: %s 跳过（%s）" % (label, u, info["error"]))
+            continue
+        if site in visited:
+            time.sleep(random.uniform(*PAGE_DELAY))
+        visited.add(site)
+        try:
+            src = http_html(u, timeout=25)
+        except RiskControlError as e:
+            stopped[site] = "风控/登录墙"
+            info["status"] = "blocked"
+            info["error"] = str(e)
+            errors.append("%s: %s %s（风控/登录墙，已停止该站）" % (label, u, e))
+            continue
+        except Exception as e:
+            info["status"] = "error"
+            info["error"] = str(e)
+            errors.append("%s: %s %s" % (label, u, e))
+            continue
+        links = extract_page_links(src)[:PAGE_MAX_LINKS]
+        info["title"] = page_title(src)
+        info["links"] = len(links)
+        info["bytes"] = len(src)
+        if not links:
+            wall = page_wall(src)
+            if wall:
+                stopped[site] = wall
+                info["status"] = "blocked"
+                info["error"] = wall
+                errors.append("%s: %s 未提取到链接（疑似%s，已停止该站）" % (label, u, wall))
+            else:
+                info["status"] = "empty"
+                text_len = len(re.sub(r"\s+", "", re.sub(r"<script.*?</script>|<style.*?</style>|<[^>]+>", " ", src, flags=re.S)))
+                if text_len < 300 and len(src) < 15000:
+                    info["hint"] = "前端渲染空壳（正文由 JS 加载），匿名 HTML 拿不到正文"
+            continue
+        info["status"] = "ok"
+        totals[label] = totals.get(label, 0) + len(links)
+        for lu, pwd, ctx in links:
+            extra = {"detail": u}
+            if ctx:
+                extra["context"] = ctx
+            rows.append(item(page_cloud(lu), lu, pwd, info["title"] or u, label, "", extra=extra))
+    ns = argparse.Namespace(**vars(args))
+    ns.kw, ns.limit = "", 0  # 页面链接：不按关键词排序/过滤、不做每盘条数截断（保留页面顺序）
+    return finalize_items(rows, ns, cloud_types, include, exclude), pages, errors, totals
+
+
+def suggest_queries(kw: str) -> list[str]:
+    title = (kw or "").strip() or "<片名>"
+    return ["site:%s %s %s" % (site, title, term) for site in SUGGEST_SITES for term in SUGGEST_TERMS]
 
 
 def unwrap_pansou(payload: dict) -> dict:
@@ -496,6 +854,7 @@ def search_panxiaozi(kw: str, limit: int):
     detail_errors = []
 
     def _detail(t):
+        time.sleep(random.uniform(*DETAIL_DELAY))  # 同站详情：小随机间隔（v1.7.7）
         try:
             page = http_html(t["url"], timeout=25)
         except Exception as e:
@@ -529,7 +888,7 @@ def search_panxiaozi(kw: str, limit: int):
         return rows
 
     out = []
-    with ThreadPoolExecutor(max_workers=4) as pool:
+    with ThreadPoolExecutor(max_workers=DETAIL_WORKERS) as pool:  # 同站并发上限 2（v1.7.7，原 4）
         for rows in pool.map(_detail, targets):
             out.extend(rows)
     if not out and detail_errors:
@@ -562,6 +921,7 @@ def _ataw_search_ids(kw: str, biz: str, cap: int) -> list[tuple[str, str]]:
 
 
 def _ataw_detail_rows(rid: str, biz_hint: str) -> list[dict]:
+    time.sleep(random.uniform(*DETAIL_DELAY))  # 同站详情：小随机间隔（v1.7.7）
     data = http_json(ATAW_BASE + "/api/v1/public/resources/" + rid, timeout=25)
     if data.get("isDeleted"):
         return []
@@ -603,7 +963,7 @@ def search_ataw(kw: str, limit: int = 8):
     targets = list(by_id.items())[: max(1, min(limit, 15))]
     out = []
     if targets:
-        with ThreadPoolExecutor(max_workers=4) as pool:
+        with ThreadPoolExecutor(max_workers=DETAIL_WORKERS) as pool:  # 同站并发上限 2（v1.7.7，原 4）
             futs = {pool.submit(_ataw_detail_rows, rid, b): rid for rid, b in targets}
             for fut in as_completed(futs):
                 try:
@@ -751,6 +1111,8 @@ def format_text(kw: str, items: list, errors: list, totals: dict) -> str:
             lines.append("  %s. %s" % (i, rec.get("note") or "无标题"))
             lines.append("     链接: %s" % rec["url"])
             lines.append("     提取码: %s" % (rec.get("password") or "无"))
+            if rec.get("context"):  # 仅 --from_url 页面链接有：链接前的正文，便于区分同页多条资源
+                lines.append("     上下文: %s" % rec["context"])
             meta = []
             if rec.get("source"):
                 meta.append(rec["source"])
@@ -816,24 +1178,98 @@ def load_engine_state() -> dict:
 
 
 def save_engine_state(st: dict) -> None:
+    """先写临时文件再 os.replace（并发进程读到的要么是旧文件要么是新文件，不会读到半截 JSON）；
+    替换失败（如 Windows 上文件正被占用）时回退为直接覆盖写。格式与 1.7.6 相同（多出的 risk/cooldown_min 键 1.7.6 会忽略）。"""
     try:
-        os.makedirs(os.path.dirname(ENGINE_STATE_PATH), exist_ok=True)
+        d = os.path.dirname(ENGINE_STATE_PATH)
+        if d:
+            os.makedirs(d, exist_ok=True)
+        data = json.dumps(st, ensure_ascii=False, indent=1)
+    except (OSError, TypeError, ValueError):
+        return
+    tmp = "%s.%d.tmp" % (ENGINE_STATE_PATH, os.getpid())
+    try:
+        with open(tmp, "w", encoding="utf-8") as f:
+            f.write(data)
+        os.replace(tmp, ENGINE_STATE_PATH)
+        return
+    except OSError:
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+    try:
         with open(ENGINE_STATE_PATH, "w", encoding="utf-8") as f:
-            json.dump(st, f, ensure_ascii=False, indent=1)
+            f.write(data)
     except OSError:
         pass
 
 
 def engine_blocked(name: str, st: dict) -> bool:
-    """连续 ENGINE_FAIL_LIMIT 次失败后冷却 ENGINE_COOLDOWN_MIN 分钟（PanSeek 插件熔断的脚本化移植）。"""
+    """连续 ENGINE_FAIL_LIMIT 次失败后冷却 ENGINE_COOLDOWN_MIN 分钟（PanSeek 插件熔断的脚本化移植）。
+    v1.7.7：强风控失败（risk=True：429/412/验证码页）一次即冷却 cooldown_min 分钟（默认 RISK_COOLDOWN_MIN）。"""
     e = st.get(name) or {}
-    if int(e.get("fails") or 0) < ENGINE_FAIL_LIMIT:
+    if e.get("risk"):
+        try:
+            cd = int(e.get("cooldown_min") or RISK_COOLDOWN_MIN)
+        except (TypeError, ValueError):
+            cd = RISK_COOLDOWN_MIN
+    elif int(e.get("fails") or 0) < ENGINE_FAIL_LIMIT:
         return False
+    else:
+        cd = ENGINE_COOLDOWN_MIN
     try:
         last = datetime.fromisoformat(e.get("last_fail") or "")
     except ValueError:
         return False
-    return (datetime.now() - last) < timedelta(minutes=ENGINE_COOLDOWN_MIN)
+    return (datetime.now() - last) < timedelta(minutes=cd)
+
+
+_RISK_MSG_STRONG_RE = re.compile(
+    r"HTTP (?:412|429)\b|HTTP Error (?:412|429)\b|验证码|人机验证|安全验证|captcha|风控|too many requests|请求过于频繁|rate.?limit", re.I)
+_RISK_MSG_WEAK_RE = re.compile(r"HTTP (?:Error )?403\b", re.I)
+
+
+def risk_info(exc) -> tuple[int, int]:
+    """把引擎异常归类：(风控等级, Retry-After 秒)。等级 2=强风控（429/412/验证码，一次即熔断）、
+    1=弱风控（403，按普通失败计数但本轮不再重试）、0=普通失败。
+    先看异常链里的 RiskControlError，再按消息兜底匹配（ataw/盘小子会把子请求错误拼进消息）。"""
+    e, depth = exc, 0
+    while e is not None and depth < 6:
+        if isinstance(e, RiskControlError):
+            return (2 if e.strong else 1), e.retry_after
+        e = e.__cause__ or e.__context__
+        depth += 1
+    msg = str(exc or "")
+    if _RISK_MSG_STRONG_RE.search(msg):
+        return 2, 0
+    if _RISK_MSG_WEAK_RE.search(msg):
+        return 1, 0
+    return 0, 0
+
+
+def risk_cooldown_min(retry_after: int) -> int:
+    ra = min(max(0, int(retry_after or 0)), RISK_COOLDOWN_MAX_MIN * 60)
+    return min(RISK_COOLDOWN_MAX_MIN, max(RISK_COOLDOWN_MIN, int(math.ceil(ra / 60.0))))
+
+
+def mark_engine_failure(st: dict, name: str, level: int = 0, retry_after: int = 0) -> None:
+    """失败计数回写（就地修改 st）。level=2 强风控：立即熔断（fails 拉到阈值以保证 1.7.6 读同一文件也会熔断）。"""
+    e = st.get(name) or {}
+    e["fails"] = int(e.get("fails") or 0) + 1
+    e["last_fail"] = datetime.now().strftime("%Y-%m-%dT%H:%M:%S")
+    if level >= 2:
+        e["fails"] = max(e["fails"], ENGINE_FAIL_LIMIT)
+        e["risk"] = True
+        e["cooldown_min"] = risk_cooldown_min(retry_after)
+    else:
+        e.pop("risk", None)
+        e.pop("cooldown_min", None)
+    st[name] = e
+
+
+def risk_blocked(name: str, st: dict) -> bool:
+    return bool((st.get(name) or {}).get("risk")) and engine_blocked(name, st)
 
 
 def load_dead_links() -> set:
@@ -847,7 +1283,7 @@ def load_dead_links() -> set:
         return set()
 
 
-def _search_once(args, engines, cloud_types, include, exclude, kw=None, elapsed=None):
+def _search_once(args, engines, cloud_types, include, exclude, kw=None, elapsed=None, risky_out=None):
     if kw and kw != args.kw:
         ns = argparse.Namespace(**vars(args))
         ns.kw = kw
@@ -856,6 +1292,7 @@ def _search_once(args, engines, cloud_types, include, exclude, kw=None, elapsed=
     by_name = {}
     errors = []
     totals = {}
+    risky = {}
     t_start = time.monotonic()
     with ThreadPoolExecutor(max_workers=max(1, len(jobs))) as pool:
         futs = {pool.submit(fn): name for name, fn in jobs.items()}
@@ -867,6 +1304,9 @@ def _search_once(args, engines, cloud_types, include, exclude, kw=None, elapsed=
                 by_name[name] = rows
             except Exception as e:
                 errors.append("%s: %s" % (name, e))
+                level, retry_after = risk_info(e)
+                if level:
+                    risky[name] = (level, retry_after)
             if elapsed is not None:
                 elapsed[name] = round(time.monotonic() - t_start, 1)
 
@@ -877,13 +1317,13 @@ def _search_once(args, engines, cloud_types, include, exclude, kw=None, elapsed=
         if name in by_name:
             changed |= st.pop(name, None) is not None
         elif any(x.startswith(name + ":") for x in errors):
-            e = st.get(name) or {}
-            e["fails"] = int(e.get("fails") or 0) + 1
-            e["last_fail"] = datetime.now().strftime("%Y-%m-%dT%H:%M:%S")
-            st[name] = e
+            level, retry_after = risky.get(name, (0, 0))
+            mark_engine_failure(st, name, level, retry_after)  # v1.7.7：强风控一次即熔断
             changed = True
     if changed or st:
         save_engine_state(st)
+    if risky_out is not None:
+        risky_out.update(risky)
 
     merged = []
     for name in ENGINE_ORDER:
@@ -893,7 +1333,53 @@ def _search_once(args, engines, cloud_types, include, exclude, kw=None, elapsed=
     return items, totals, errors
 
 
+def run_suggest(args) -> int:
+    qs = suggest_queries(args.kw or "")
+    if args.json:
+        print(json.dumps({"keyword": args.kw or "", "queries": qs}, ensure_ascii=False, indent=2))
+    else:
+        print("宿主 WebSearch 建议查询（找到公开页面后用 --from_url 提取直链，单次 ≤%d 个）：" % PAGE_MAX_URLS)
+        for q in qs:
+            print("  " + q)
+    return 0
+
+
+def print_pages(pages: list) -> None:
+    for pg in pages:
+        bits = "%s %s：%s，%s 条" % (pg["source"], pg["url"], pg.get("status") or "?", pg.get("links") or 0)
+        if pg.get("error"):
+            bits += "（%s）" % pg["error"]
+        print("页面提取: " + bits)
+
+
+def run_pages(args, page_urls) -> int:
+    """仅页面提取模式（--from_url 且未给 --kw）：不跑任何搜索引擎。"""
+    cloud_types = split_csv(args.cloud_types)
+    include = split_csv(args.include)
+    exclude = split_csv(args.exclude)
+    items, pages, errors, totals = collect_pages(args, page_urls, cloud_types, include, exclude)
+    result = {
+        "keyword": "",
+        "total": len(items),
+        "totals": totals,
+        "errors": errors,
+        "results": items,
+        "pages": pages,
+    }
+    if args.json:
+        print(json.dumps(result, ensure_ascii=False, indent=2))
+    else:
+        print_pages(pages)
+        print(format_text("（页面提取，%d 个页面）" % len(pages), items, errors, totals))
+    return 0 if items or not errors else 1
+
+
 def run(args):
+    if getattr(args, "suggest_queries", False):
+        return run_suggest(args)
+    page_urls = split_csv(getattr(args, "from_url", None))
+    if page_urls and not args.kw:
+        return run_pages(args, page_urls)
     engines = [e.strip() for e in (args.engine or "pansou,haisou,yunso,ataw").split(",") if e.strip()]
     if "all" in engines:
         # all = 默认四源（含 ataw），且保留同批次显式指定的其它引擎（如 all,panxiaozi）
@@ -912,13 +1398,16 @@ def run(args):
                 skipped.append(e)
 
     elapsed = {}
-    items, totals, errors = _search_once(args, engines, cloud_types, include, exclude, elapsed=elapsed)
+    risky_now = {}
+    items, totals, errors = _search_once(args, engines, cloud_types, include, exclude, elapsed=elapsed, risky_out=risky_now)
 
     # 关键词变体兜底（借鉴 PanHub searchKeyword 思路）：0结果时用变体重试一轮
     variant_used = ""
     if not items and not getattr(args, "no_variants", False):
-        for v in kw_variants(args.kw):
-            v_items, v_totals, v_errors = _search_once(args, engines, cloud_types, include, exclude, kw=v, elapsed=elapsed)
+        # v1.7.7：本轮刚撞风控（429/412/验证码/403）的引擎不参与变体重试（避免立即再撞）；普通失败行为不变
+        v_engines = [e for e in engines if e not in risky_now]
+        for v in kw_variants(args.kw) if v_engines else []:
+            v_items, v_totals, v_errors = _search_once(args, v_engines, cloud_types, include, exclude, kw=v, elapsed=elapsed)
             if v_items:
                 variant_used = v
                 items = v_items
@@ -927,7 +1416,9 @@ def run(args):
                 break
 
     ataw_fallback = False
-    if should_ataw_fallback(engines, items):
+    if should_ataw_fallback(engines, items) and risk_blocked("ataw", load_engine_state()):
+        errors.append("ataw(fallback): 风控冷却中，已跳过")
+    elif should_ataw_fallback(engines, items):
         try:
             fb_rows, fb_total = search_ataw(args.kw, args.limit)
             if fb_rows:
@@ -936,6 +1427,19 @@ def run(args):
                 items = finalize_items(items + fb_rows, args, cloud_types, include, exclude)
         except Exception as e:
             errors.append("ataw(fallback): %s" % e)
+            level, retry_after = risk_info(e)
+            if level >= 2:  # 兜底撞强风控也记入熔断，下次兜底直接跳过
+                st_fb = load_engine_state()
+                mark_engine_failure(st_fb, "ataw", level, retry_after)
+                save_engine_state(st_fb)
+
+    pages = None
+    if page_urls:
+        p_items, pages, p_errors, p_totals = collect_pages(args, page_urls, cloud_types, include, exclude)
+        seen_urls = {norm_url(r["url"]) for r in items}
+        items = items + [r for r in p_items if norm_url(r["url"]) not in seen_urls]
+        errors = errors + p_errors
+        totals.update(p_totals)
 
     errors.sort()
     result = {
@@ -953,15 +1457,23 @@ def run(args):
         result["skipped_engines"] = skipped
     if variant_used:
         result["variant_used"] = variant_used
+    if pages is not None:
+        result["pages"] = pages
+        result["page_note"] = "页面链接未按 --kw 过滤（--kw 只作用于引擎搜索），排在引擎结果之后"
     if args.json:
         print(json.dumps(result, ensure_ascii=False, indent=2))
     else:
         if skipped:
-            print("熔断跳过: %s（--fresh 强制重试）" % "、".join(skipped))
+            print("熔断跳过: %s（--fresh 强制重试）" % "、".join(
+                e + ("(风控)" if (st.get(e) or {}).get("risk") else "") for e in skipped))
         if elapsed:
             slow = sorted(elapsed.items(), key=lambda x: -x[1])
             print("各源耗时: " + "；".join("%s %.1fs" % (k, v) for k, v in slow))
+        if pages is not None:
+            print_pages(pages)
         print(format_text(args.kw, items, errors, totals))
+        if pages is not None:
+            print("（页面链接未按关键词过滤，排在引擎结果之后）")
         if variant_used:
             print("（0 结果已自动用变体「%s」重试）" % variant_used)
         if ataw_fallback:
@@ -971,7 +1483,7 @@ def run(args):
 
 def main():
     p = argparse.ArgumentParser(description="多源网盘资源搜索")
-    p.add_argument("--kw", required=True, help="搜索关键词")
+    p.add_argument("--kw", help="搜索关键词（必填；仅 --from_url / --suggest_queries 时可省略）")
     p.add_argument("--cloud_types", help="网盘类型，逗号分隔，如 quark,aliyun,baidu")
     p.add_argument("--include", help="结果须含这些词，逗号分隔")
     p.add_argument("--exclude", help="排除这些词，逗号分隔")
@@ -988,8 +1500,14 @@ def main():
     p.add_argument("--pansou_timeout", type=float, default=45.0, help="盘搜请求超时秒数（默认 45；急用可调小，代价是聚合不全、结果变少）")
     p.add_argument("--fresh", action="store_true", help="忽略引擎熔断状态，强制全引擎执行")
     p.add_argument("--no-variants", action="store_true", help="禁用 0 结果时的关键词变体自动重试")
+    p.add_argument("--from_url", help="公开页面 URL，逗号分隔，单次最多 %d 个：抓页面提取网盘直链（无 --kw 时只做页面提取）" % PAGE_MAX_URLS)
+    p.add_argument("--suggest_queries", action="store_true", help="打印供宿主 WebSearch 用的 site: 查询建议（配合 --kw），不联网")
     p.add_argument("--json", action="store_true")
     args = p.parse_args()
+    if args.kw is not None and not args.kw.strip():
+        args.kw = None  # 空白关键词视同未提供
+    if not args.kw and not split_csv(args.from_url) and not args.suggest_queries:
+        p.error("必须提供 --kw（或使用 --from_url / --suggest_queries）")
     sys.exit(run(args))
 
 

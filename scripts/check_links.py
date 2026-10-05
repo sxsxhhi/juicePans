@@ -13,6 +13,8 @@
      失效 12h 后复查是否恢复；磁力/电驴等不可检类型永不误伤；
      检测异常（uncertain）不计入失败。状态存本地 JSON（默认 ~/.pan_search/link_state.json）。
 公开盘搜本身不当检测服务，绝不编造有效/失效。
+
+--file 行格式（v1.7.7）：`URL`、`URL<TAB>提取码` 或 `URL 提取码`（逐链提取码，优先于全局 --password）。
 """
 
 from __future__ import annotations
@@ -332,6 +334,27 @@ def verify_anon(url, dtype, password=""):
         return "uncertain", "内置匿名检测失败: %s" % e
 
 
+# 行内提取码只认 2–16 位字母数字（可带「提取码:」等前缀）；`URL 片名` 这类附注不会被误当提取码，`URL 提取码:` 空值也不会把冒号当码
+_FILE_PWD_RE = re.compile(
+    r"^(?:(?:提取码|提取密码|访问码|访问密码|密码|pwd|password|passcode|code)\s*[:：=]?\s*)?([A-Za-z0-9]{2,16})(?=\s|#|$)", re.I)
+
+
+def parse_link_line(line, default_pwd=""):
+    """解析 --file 的一行：`URL` / `URL<TAB>pwd` / `URL pwd`（也容忍 `URL 提取码:abcd`）。
+    返回 (url, pwd) 或 None（空行/注释）。行内无提取码时回落到全局 --password。"""
+    line = (line or "").strip()
+    if not line or line.startswith("#"):
+        return None
+    parts = line.split(None, 1)
+    url = parts[0]
+    pwd = ""
+    if len(parts) > 1:
+        m = _FILE_PWD_RE.match(parts[1].strip())
+        if m:
+            pwd = m.group(1)
+    return url, (pwd or default_pwd or "")
+
+
 def load_state(path):
     try:
         with open(path, encoding="utf-8") as f:
@@ -395,9 +418,9 @@ def state_update(rec, verdict, now, summary=""):
 def main():
     p = argparse.ArgumentParser(description="网盘链接检测（诚实标注，不编造）")
     p.add_argument("--url", action="append", help="待检测链接，可重复")
-    p.add_argument("--file", help="每行一个链接，# 开头为注释")
+    p.add_argument("--file", help="每行一个链接，# 开头为注释；可写 `URL<TAB>提取码` 或 `URL 提取码`（逐链提取码）")
     p.add_argument("--type", help="网盘类型；默认从 URL 识别")
-    p.add_argument("--password", default="", help="提取码")
+    p.add_argument("--password", default="", help="提取码（全局默认；--file 行内提取码优先）")
     p.add_argument("--proxy", help="检测代理 socks5://...")
     p.add_argument("--api", help="PanSou API 根地址")
     p.add_argument("--quark_skill_dir", help="夸克 CLI skill 目录（或设 QUARK_SKILL_DIR）")
@@ -408,14 +431,14 @@ def main():
     p.add_argument("--force", action="store_true", help="忽略复检策略，全部强制实测")
     args = p.parse_args()
 
-    urls = list(args.url or [])
+    pairs = [(u, args.password) for u in (args.url or [])]
     if args.file:
-        with open(args.file, encoding="utf-8") as f:
+        with open(args.file, encoding="utf-8-sig", errors="replace") as f:
             for line in f:
-                line = line.strip()
-                if line and not line.startswith("#"):
-                    urls.append(line)
-    if not urls:
+                parsed = parse_link_line(line, args.password)
+                if parsed:
+                    pairs.append(parsed)
+    if not pairs:
         p.print_help()
         print("\n请提供 --url 或 --file", file=sys.stderr)
         sys.exit(2)
@@ -431,32 +454,32 @@ def main():
     quark = detect_quark(args.quark_skill_dir, args.node_bin)
 
     rows = []
-    for url in urls:
+    for url, pwd in pairs:
         dtype = args.type or detect_disk_type(url)
         if dtype in ("magnet", "ed2k"):
-            rows.append({"disk_type": dtype, "url": url, "password": args.password,
+            rows.append({"disk_type": dtype, "url": url, "password": pwd,
                          "_via": "skip", "state": "unsupported",
                          "summary": "磁力/电驴链接不做有效性检测（永不误伤）"})
             continue
         act, cached = state_decision(store.get(url) or {}, now, args.force)
         if act == "cache":
             age_h = (now - float(cached.get("last_checked") or 0)) / 3600
-            rows.append({"disk_type": dtype, "url": url, "password": args.password,
+            rows.append({"disk_type": dtype, "url": url, "password": pwd,
                          "_via": "cache", "state": cached.get("state") or "uncertain",
                          "summary": "%s（状态机缓存 %.1fh 前实测，未复检；--force 强制）"
                                     % (cached.get("summary") or "", age_h),
                          "_cached": True})
             continue
         if dtype == "quark" and quark:
-            state, summary = verify_quark(quark[0], quark[1], url, args.password)
-            rows.append({"disk_type": dtype, "url": url, "password": args.password,
+            state, summary = verify_quark(quark[0], quark[1], url, pwd)
+            rows.append({"disk_type": dtype, "url": url, "password": pwd,
                          "_via": "direct", "state": state, "summary": summary})
         elif api:
-            rows.append({"disk_type": dtype, "url": url, "password": args.password,
+            rows.append({"disk_type": dtype, "url": url, "password": pwd,
                          "_via": "api", "state": None, "summary": None})
         else:
-            state, summary = verify_anon(url, dtype, args.password)
-            rows.append({"disk_type": dtype, "url": url, "password": args.password,
+            state, summary = verify_anon(url, dtype, pwd)
+            rows.append({"disk_type": dtype, "url": url, "password": pwd,
                          "_via": "direct", "state": state, "summary": summary})
 
     # 有 api 时批量走自建 PanSou

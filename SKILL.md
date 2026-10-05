@@ -1,11 +1,12 @@
 ---
 name: juicePans
-version: 1.7.6
+version: 1.7.7
 description: >-
   果汁搜盘（英文名 juicePans）：搜索公开网盘影视与资料分享链接（夸克、百度、阿里、迅雷、UC、115、天翼、移动、123、蓝奏、磁力等）。
   默认并行查询公开盘搜、海搜、小云搜索、TA搜（ataw），去重后智能排序并按网盘分组；可选盘小子、影视库。
   若用户显式排除 ataw 且默认源失败或无可用直链，脚本自动 TA搜 兜底（JSON 可含 ataw_fallback），再交宿主 WebSearch 穷尽公开检索。
-  内置引擎熔断、关键词变体兜底重试与 8 类网盘匿名链接核验。
+  内置引擎熔断（v1.7.7 起 429/412/验证码页一次即冷却，403 仍按 2 次计）、关键词变体兜底重试与 8 类网盘匿名链接核验；
+  v1.7.7 新增 --from_url 公开页面直链提取（B站专栏/贴吧/知乎/豆瓣小组等，单次≤5页）与 --suggest_queries 站内检索建议。
   纯标准库、零依赖；上报前区分「已核验」与「公开检索（未核验）」，不编造链接/提取码/来源。
   只搜不转存：链接须先核验存活并列给用户，经用户批准并指明目标目录后才交夸克转存。
   Use when the user asks 搜网盘、找资源、找电影、找剧、找动漫、搜片、网盘链接、夸克资源、百度网盘、阿里云盘、
@@ -14,7 +15,7 @@ description: >-
 
 # 果汁搜盘 juicePans（网盘资源搜索）
 
-本技能由 Cursor 整合版（1.1.0）与 WorkBuddy 整合版合并而来，并按多环境实测调校（沿革见 [整合说明.md](整合说明.md)）。
+本技能由 Cursor 整合版（1.1.0）与 WorkBuddy 整合版合并而来，并按多环境实测调校。
 脚本相对本技能根目录，纯标准库，不要装 Docker / uv / requests。
 Windows 控制台先设 UTF-8：`$env:PYTHONUTF8=1`；解释器优先 `python`，没有用 `python3`。
 
@@ -52,9 +53,9 @@ python scripts/search.py --kw "片名" --src all
 ## 流程
 
 1. 抽出关键词（片名优先中文；季/画质/网盘有就带上）。模糊先问清。用户没想好找什么时，可用 `--engine movie` 列影视库热门/4K 榜单当发现入口（借鉴 PanHub 豆瓣榜单思路）。
-2. 在本技能根目录跑搜索脚本。用户指定网盘则加 `--cloud_types`；要 4K、不要预告用 `--include` / `--exclude`。脚本内置三项增强（v1.5.0）：综合排序（关键词匹配度 > 来源等级 > 时间新鲜度）、引擎熔断（连续失败 2 次自动冷却 30 分钟，`--fresh` 强制全跑）、0 结果自动用关键词变体重试一轮。
+2. 在本技能根目录跑搜索脚本。用户指定网盘则加 `--cloud_types`；要 4K、不要预告用 `--include` / `--exclude`。脚本内置三项增强（v1.5.0）：综合排序（关键词匹配度 > 来源等级 > 时间新鲜度）、引擎熔断（普通失败连续 2 次冷却 30 分钟；**v1.7.7 起 HTTP 429/412 或验证码页属强风控，一次即冷却 30 分钟，`Retry-After` 更长则从其（上限 24h）；HTTP 403 仍按普通失败 2 次计**；`--fresh` 强制全跑）、0 结果自动用关键词变体重试一轮（本轮撞过 429/412/403/验证码的引擎不参与变体重试）。
 3. 把 stdout 按网盘分组给用户。链接必须可点，禁止用代码块包 URL。同一 URL 只出现一次。同组相似候选多时，按「标题匹配 > 命名规范（集数/版本信息全）> 更新时间」把最佳匹配排前（借鉴 mediary-scout）。
-4. **引擎顺序（v1.7.6）**：默认四源 `pansou,haisou,yunso,ataw` **第一轮并行**（ataw 软失败不中断）；若用户显式排除 ataw 且默认三源无可用分享直链 → 脚本自动补跑 TA搜（`--json` 时含 `ataw_fallback: true`）→ 仍无果再进入 **v1.7.0 全网穷尽**：宿主 WebSearch 多轮不设上限、直抓公开页面提取直链、IMDb/百科别名交叉补搜、GitHub 聚合与 BT/磁力备选；硬约束不变（不爬 [sources.md](references/sources.md) 黑名单、不对单站高频连发、撞登录墙/验证码即止、不编造结果）。
+4. **引擎顺序（v1.7.6）**：默认四源 `pansou,haisou,yunso,ataw` **第一轮并行**（ataw 软失败不中断）；若用户显式排除 ataw 且默认三源无可用分享直链 → 脚本自动补跑 TA搜（`--json` 时含 `ataw_fallback: true`）→ 仍无果再进入 **v1.7.0 全网穷尽**：宿主 WebSearch 多轮不设上限（可先跑 `--suggest_queries` 拿 site: 查询建议）、直抓公开页面提取直链（**v1.7.7 用 `--from_url` 交给脚本提取**，见下文「公开页面直链提取」）、IMDb/百科别名交叉补搜、GitHub 聚合与 BT/磁力备选；硬约束不变（不爬 [sources.md](references/sources.md) 黑名单、不对单站高频连发、撞登录墙/验证码即止、不编造结果）。
 5. 候选中出现「失效 / 疑似失效」时，自动补搜下一候选替换（自动换链，借鉴 cloud-auto-save-x），不把死链端给用户。
 6. 无结果就如实说，建议换原名/简称，不要凑数。
 
@@ -70,11 +71,14 @@ python scripts/search.py --kw "庆余年" --engine panxiaozi
 python scripts/search.py --kw "庆余年" --engine ataw --json
 python scripts/search.py --kw "片名" --src all
 python scripts/search.py --kw "庆余年" --engine all,panxiaozi --json
+python scripts/search.py --kw "哪吒2" --suggest_queries
+python scripts/search.py --from_url "https://www.bilibili.com/opus/1079099323286814755" --json
+python scripts/search.py --kw "三体" --from_url "https://www.bilibili.com/opus/xxx,https://tieba.baidu.com/p/xxx"
 ```
 
 | 参数 | 说明 |
 |---|---|
-| `--kw` | 必填。海搜还支持 `"精确短语"` 和 `-排除词` |
+| `--kw` | 必填（仅 `--from_url` 只做页面提取、或 `--suggest_queries` 时可省；空白视同未填，报错退出码 2）。海搜还支持 `"精确短语"` 和 `-排除词` |
 | `--cloud_types` | `quark,aliyun,baidu,...`，见 [cloud-types.md](references/cloud-types.md) |
 | `--include` / `--exclude` | 逗号分隔；盘搜可走服务端，其它源本地再滤 |
 | `--engine` | 默认 `pansou,haisou,yunso,ataw`。`all` = 这四源。`movie` / `panxiaozi` 需显式指定；显式排除 ataw 且默认源无果时仍会自动兜底 |
@@ -88,7 +92,20 @@ python scripts/search.py --kw "庆余年" --engine all,panxiaozi --json
 | `--pansou_timeout` | 盘搜超时秒数（默认 45）。公开盘搜是聚合源、天然偏慢（实测 40s+）；急用可调小如 `--pansou_timeout 15`，代价是聚合不全。文本输出含「各源耗时」可定位慢源 |
 | `--fresh` | 忽略引擎熔断状态，强制全部引擎执行 |
 | `--no-variants` | 禁用 0 结果时的关键词变体自动重试 |
-| `--json` | 机器可读（含 `elapsed`、可选 `ataw_fallback`） |
+| `--from_url` | v1.7.7：公开页面 URL，逗号分隔（重复 URL 自动去重），**单次最多 5 个**（多余忽略并在 errors 说明）。无 `--kw` 时**只做页面提取**、不跑任何引擎；有 `--kw` 时引擎照常搜，页面链接**不按关键词过滤**、追加在引擎结果之后（JSON 含 `pages`、`page_note`） |
+| `--suggest_queries` | v1.7.7：打印供宿主 WebSearch 用的 `site:` 查询建议（B站 opus/read、贴吧、知乎、豆瓣小组 × 「夸克 网盘」/`pan.quark.cn`），不联网；配合 `--kw` |
+| `--json` | 机器可读（含 `elapsed`、可选 `ataw_fallback`；`--from_url` 时另含 `pages` / `page_note`） |
+
+## 公开页面直链提取（v1.7.7 `--from_url`）
+
+用于 v1.7.0「全网穷尽」里「直抓公开页面提取直链」这一步，把宿主 WebSearch 找到的帖子/专栏交给脚本解析：
+
+- 抓取：复用 `http_html()`（浏览器 UA）；**串行**，同站请求间隔 0.5–1.5s 随机；单次 ≤5 页。
+- 解码：页面源码先做 JSON 转义还原（`\u002F`、`\/`）、HTML 实体解码、跳转包装（如 `link.zhihu.com/?target=https%3A//…`）URL 解码。
+- 提取：`links_from_text()`——全角转半角；识别带/不带 `https://`（含协议相对 `//`）的夸克/百度/阿里(alipan/aliyundrive)/迅雷/UC/115/天翼/移动(139/caiyun)/123/蓝奏/PikPak 分享链接与磁力；截掉尾随标点与中文；提取码优先取 URL 的 `pwd=`/`password=`，否则取链接后 40 字符内**最近的**「提取码/密码/访问码/pwd/code」且不越过下一条链接（逐链配对，不共用一个码）；也认「(访问码: abcd): URL」这种码后紧跟冒号的**前置**写法（此时该码归后面的链接，不会错配给前一条）；规范化去重。
+- 输出：每条走 `item()` + `finalize_items()`；`source` 为 `page:bilibili` / `page:tieba` / `page:zhihu` / `page:douban` / `page:<域名>`；`detail` = 页面 URL，`context` = 链接前 ≤40 字正文（便于看清是哪部资源；文本输出显示为「上下文」行）；`note` = 页面标题。页面链接保留页面顺序、不做每盘条数截断（单页上限 100 条），`--cloud_types` / `--include` / `--exclude` 仍生效。
+- 风控纪律：HTTP 403/412/429、验证码页、或「未提取到链接 + 登录墙特征」→ **立即停止该站剩余页面**，在 `errors` / `pages[].status=blocked` 里软报错，不重试、不绕过。
+- 本沙箱实测（2026-10-05，详见 [sources.md](references/sources.md)）：B站 opus 匿名 HTML **时好时坏**（同一出口连续请求约 10 次后返回「验证码_哔哩哔哩」页）；B站 read/cv 专栏为前端渲染空壳；贴吧 403「百度安全验证」；豆瓣小组 403；知乎专栏 403、`/tardis/` 为 SPA 空壳。撞墙即如实告知用户，可改让用户在浏览器打开后粘贴正文。
 
 ## 链接核验（本版规则）
 
@@ -107,6 +124,15 @@ python scripts/search.py --kw "庆余年" --engine all,panxiaozi --json
 python scripts/check_links.py --url "https://pan.quark.cn/s/xxxx"
 python scripts/check_links.py --file links.txt --json
 python scripts/check_links.py --file links.txt --force   # 忽略缓存全量实测
+```
+
+`--file` 每行一条（`#` 开头为注释），v1.7.7 起支持**逐链提取码**，旧格式（纯 URL + 全局 `--password`）照旧可用；行内提取码（2–16 位字母数字，可带「提取码:」前缀）优先于 `--password`，URL 后跟中文片名等附注不会被当成提取码：
+
+```text
+https://pan.quark.cn/s/xxxx	abcd        # URL<TAB>提取码
+https://pan.baidu.com/s/1xxxx abcd      # URL 空格 提取码
+https://pan.baidu.com/s/1yyyy 提取码:abcd
+https://pan.quark.cn/s/zzzz             # 无码则用 --password（缺省为空）
 ```
 
 **内容核查（夸克链推荐）**：`check_links.py` 只能证明「链接还活着」，证明不了里面有什么——夸克分享的根目录常是一个文件夹。
@@ -170,11 +196,12 @@ cd <夸克网盘skill目录> && node scripts/quark-drive.cjs share-detail --url 
 |---|---|
 | 某一源失败、其它有结果 | 交付有结果的，并注明失败源（脚本已内置，不会中断） |
 | pansou `POST` 超时 / 400 | 脚本对公开站**默认 GET**；仍失败则其余默认源（含 ataw）照常返回结果 |
-| 海搜 429 | 连续失败 2 次会熔断冷却 30 分钟自动恢复；急用 `--fresh` 或 `--engine pansou,yunso` |
+| 海搜 429 | v1.7.7 起 429/412/验证码页属**强风控**：一次即熔断冷却 30 分钟（`Retry-After` 更长则从其，上限 24h），JSON `skipped_engines` / 文本「熔断跳过: haisou(风控)」；403 与普通失败仍是 2 次 / 30 分钟。急用 `--fresh` 或 `--engine pansou,yunso` |
 | 影视库 502 | `meng-ge.top` 本沙箱被拦；仅 `--engine movie` 时试，失败即跳过 |
 | ataw 单 biz 失败 | 其它 biz 仍返回；显式排除 ataw 的调用全失败时在 `errors` 里见 `ataw(fallback):` |
 | 检测接口 404 / 无服务 | 内置 8 类匿名检测可直接用（夸克/阿里/115/123/天翼/百度/蓝奏/UC）；其余类型不编有效/失效 |
-| 全部失败 | 换关键词（脚本已自动试变体 + ataw）；仍无则 WebSearch 穷尽兜底 |
+| 全部失败 | 换关键词（脚本已自动试变体 + ataw）；仍无则 WebSearch 穷尽兜底（`--suggest_queries` → `--from_url`） |
+| `--from_url` 报 blocked | 该站撞风控/登录墙，已自动停止该站；不要换 UA/重试绕过，如实告知或请用户粘贴正文 |
 
 ## 检查清单
 

@@ -150,6 +150,7 @@ juicePans/
 | 1.7.0 | 全网穷尽兜底：引擎无果 / 结果全错时穷尽全网检索（WebSearch 多轮不设上限、直抓公开页面提取直链、别名交叉补搜、BT/磁力备选），时间不限；硬约束保留（不爬黑名单、撞登录墙/验证码即止） |
 | 1.7.5 | 新增 TA搜（`ataw`）引擎与默认源自动兜底；移除 `ghspider`；TG 改走公开盘搜 `--src all`；版本与文档统一 1.7.5 |
 | 1.7.6 | ataw 升为默认引擎（`--engine all` 含 ataw）；自动兜底仅保留给显式排除 ataw 的调用；README 安装指令改为一键复制框 |
+| 1.7.7 | 强风控（429/412/验证码）一次即熔断 30 分钟并遵守 Retry-After；ataw/盘小子详情并发降为 2 + 随机间隔；错误响应体限读 8KB；熔断状态原子写入；新增 `--from_url` 公开页面直链提取与 `--suggest_queries`；链接提取增强；移除 整合说明.md |
 
 ## 致谢 / 参考项目
 
@@ -173,6 +174,7 @@ juicePans/
 - [Cp0204/quark-auto-save](https://github.com/Cp0204/quark-auto-save) —— 失效链接沉底与频率风控纪律思路来源；
 - [fancydirty/mediary-scout](https://github.com/fancydirty/mediary-scout) —— 「最佳匹配」展示维度思路来源；
 - [OzoO0/cloud-auto-save-x](https://github.com/OzoO0/cloud-auto-save-x) —— 交付前失效候选自动换链思路来源；
+- [NanmiCoder/MediaCrawler](https://github.com/NanmiCoder/MediaCrawler) —— 参考其风控熔断与请求限速思路（未引用其代码）；
 
 **感谢上述项目的作者们将经验开源共享。**
 

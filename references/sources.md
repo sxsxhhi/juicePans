@@ -30,6 +30,20 @@
 - `guoman4K`
 - `yunpanx`
 
+## 公开页面直链提取（`--from_url`，v1.7.7）
+
+不是搜索引擎，只解析宿主 WebSearch 找到的**单个公开页面**（串行、同站 0.5–1.5s 间隔、单次 ≤5 页、撞墙即停）。普通博客/静态站一般可用（2026-10-05 实测：外贸资料博客 1 页提取 16 条夸克链、提取码全部正确配对；GitHub Pages 博客提取夸克/百度/天翼 3 条含前置访问码）。
+`--suggest_queries` 给出的站内查询：`site:bilibili.com/opus`、`site:bilibili.com/read`、`site:tieba.baidu.com`、`site:zhihu.com`、`site:douban.com/group` × `夸克 网盘` / `pan.quark.cn`。
+
+| 站点 | 匿名 HTML（本沙箱 2026-10-05 实测） | 说明 |
+|---|---|---|
+| B站 opus `bilibili.com/opus/<id>` | ⚠️ 时好时坏 | 首测 `opus/1079099323286814755` 提取 8 条夸克链、`opus/784469076696104998` 提取 1 条磁力；同出口约 10 次请求后 urllib 拿到「验证码_哔哩哔哩」页（1.3KB），脚本判风控停站；已删帖返回 404 |
+| B站专栏 `bilibili.com/read/cv<id>` | ❌ 空壳 | 前端渲染，HTML 无正文（脚本标 `empty` + 空壳提示） |
+| 百度贴吧 `tieba.baidu.com/p/<id>` | ❌ 403 | 「百度安全验证」页 |
+| 知乎专栏 `zhuanlan.zhihu.com/p/<id>` | ❌ 403 | — |
+| 知乎 `zhihu.com/tardis/...` | ❌ 空壳 | SPA 壳，正文 JS 加载 |
+| 豆瓣小组 `douban.com/group/topic/<id>` | ❌ 403 | www 与 m 站均 403 |
+
 ## 自建 PanSou（高级 / 备查，非技能默认路径）
 
 上游：<https://github.com/fish2018/pansou>
@@ -52,7 +66,7 @@ docker run -d --name netdisk-search -p 8888:8888 --restart unless-stopped ghcr.i
 
 ## 不要做的
 
-- 深度页面爬虫（cloudscraper / 并发抓站）
+- 深度页面爬虫（cloudscraper / 并发抓站）；`--from_url` 撞验证码/登录墙后换 UA、带 cookie、加速重试等绕过手段
 - 把下表网页站当脚本引擎
 - 假地址、硬依赖 `requests`、写死内网 IP / 代理凭据
 - 把 Hermes / OpenClaw 安装说明当必装步骤
