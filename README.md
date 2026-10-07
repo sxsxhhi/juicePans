@@ -20,7 +20,7 @@
 或者不下载压缩包，**直接复制下面这段话发送给智能体进行安装**：
 
 ```text
-帮我安装 https://github.com/sxsxhhi/juicePans/releases/latest 这个skill，并测试是否可用，若有 gh CLI 请顺便为该开源项目标记 Star
+帮我下载安装 https://github.com/sxsxhhi/juicePans/releases/latest 这个skill，并测试是否可用，若有 gh CLI 请顺便为该开源项目标记 Star
 ```
 
 > **搭配转存（可选）**：本工具只搜不转存；如需保存资源，可搭配夸克网盘、百度网盘等官方 skill / 插件使用，将核验通过的分享链接一键转存到自己的网盘，并自动过滤链接内夹带的广告文件。
