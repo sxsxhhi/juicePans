@@ -1,12 +1,12 @@
 ---
 name: juicePans
-version: 1.7.7
+version: 1.8.0
 description: >-
   果汁搜盘（英文名 juicePans）：搜索公开网盘影视与资料分享链接（夸克、百度、阿里、迅雷、UC、115、天翼、移动、123、蓝奏、磁力等）。
   默认并行查询公开盘搜、海搜、小云搜索、TA搜（ataw），去重后智能排序并按网盘分组；可选盘小子、影视库。
   若用户显式排除 ataw 且默认源失败或无可用直链，脚本自动 TA搜 兜底（JSON 可含 ataw_fallback），再交宿主 WebSearch 穷尽公开检索。
-  内置引擎熔断（v1.7.7 起 429/412/验证码页一次即冷却，403 仍按 2 次计）、关键词变体兜底重试与 8 类网盘匿名链接核验；
-  v1.7.7 新增 --from_url 公开页面直链提取（B站专栏/贴吧/知乎/豆瓣小组等，单次≤5页）与 --suggest_queries 站内检索建议。
+  内置内容级去重聚合（--all-dups 展开）、夸克内容智能按需抽查（--peek [smart|on|off]）、引擎熔断生命周期自愈（冷却期满自动归零 + 成功彻底清零）、错误消息脱敏截断、废弃引擎软校验与 pansou 50s 耗时保险丝；
+  v1.7.7 新增 --from_url 公开页面直链提取与 --suggest_queries 站内检索建议；v1.8.0 核心体验与健壮性升级。
   纯标准库、零依赖；上报前区分「已核验」与「公开检索（未核验）」，不编造链接/提取码/来源。
   只搜不转存：链接须先核验存活并列给用户，经用户批准并指明目标目录后才交夸克转存。
   Use when the user asks 搜网盘、找资源、找电影、找剧、找动漫、搜片、网盘链接、夸克资源、百度网盘、阿里云盘、
@@ -66,6 +66,9 @@ python scripts/search.py --kw "片名" --src all
 ```text
 python scripts/search.py --kw "星际穿越"
 python scripts/search.py --kw "流浪地球2" --cloud_types quark,aliyun --include 4K --exclude 预告,CAM --limit 5
+python scripts/search.py --kw "去你的岛" --cloud_types quark
+python scripts/search.py --kw "去你的岛" --cloud_types quark --all-dups
+python scripts/search.py --kw "去你的岛" --cloud_types quark --exclude 小说
 python scripts/search.py --kw "三体" --engine pansou,yunso
 python scripts/search.py --kw "庆余年" --engine panxiaozi
 python scripts/search.py --kw "庆余年" --engine ataw --json
@@ -81,7 +84,9 @@ python scripts/search.py --kw "三体" --from_url "https://www.bilibili.com/opus
 | `--kw` | 必填（仅 `--from_url` 只做页面提取、或 `--suggest_queries` 时可省；空白视同未填，报错退出码 2）。海搜还支持 `"精确短语"` 和 `-排除词` |
 | `--cloud_types` | `quark,aliyun,baidu,...`，见 [cloud-types.md](references/cloud-types.md) |
 | `--include` / `--exclude` | 逗号分隔；盘搜可走服务端，其它源本地再滤 |
-| `--engine` | 默认 `pansou,haisou,yunso,ataw`。`all` = 这四源。`movie` / `panxiaozi` 需显式指定；显式排除 ataw 且默认源无果时仍会自动兜底 |
+| `--engine` | 默认 `pansou,haisou,yunso,ataw`。`all` = 这四源。`movie` / `panxiaozi` 需显式指定；显式排除 ataw 且默认源无果时仍会自动兜底；未知或已废弃引擎（如 `ghspider`）软校验友好提示跳过 |
+| `--all-dups` | v1.8.0：展开全部同名同质资源副本（默认自动按标题去噪两级聚合折叠并注记副本数） |
+| `--peek` | v1.8.0：夸克网盘内容智能抽查模式：`smart`（默认，仅当 exclude 命中小说/电子书等题材词时自动触发）、`on`（强制抽查 Top 5）、`off`（完全关闭抽查，秒级返回） |
 | `--yunso_mode` | `90001` 智能（默认），`90002` 精准 |
 | `--src` | 仅盘搜：默认 `plugin`。`all` 含 TG，较慢 |
 | `--scope` | 仅海搜：`title`（默认）或 `files` |
@@ -89,12 +94,12 @@ python scripts/search.py --kw "三体" --from_url "https://www.bilibili.com/opus
 | `--limit` | 每种网盘最多展示条数，默认 8 |
 | `--page` / `--page_size` | 分页（默认 1 / 10），作用于海搜 / 小云 / 影视库（盘搜不支持分页） |
 | `--refresh` | 盘搜绕过缓存 |
-| `--pansou_timeout` | 盘搜超时秒数（默认 45）。公开盘搜是聚合源、天然偏慢（实测 40s+）；急用可调小如 `--pansou_timeout 15`，代价是聚合不全。文本输出含「各源耗时」可定位慢源 |
+| `--pansou_timeout` | 盘搜超时秒数（默认 45；硬预算保险丝上限 50s）。公开盘搜是聚合源、天然偏慢（实测 40s+）；急用可调小如 `--pansou_timeout 15`，代价是聚合不全。文本输出含「各源耗时」可定位慢源 |
 | `--fresh` | 忽略引擎熔断状态，强制全部引擎执行 |
 | `--no-variants` | 禁用 0 结果时的关键词变体自动重试 |
 | `--from_url` | v1.7.7：公开页面 URL，逗号分隔（重复 URL 自动去重），**单次最多 5 个**（多余忽略并在 errors 说明）。无 `--kw` 时**只做页面提取**、不跑任何引擎；有 `--kw` 时引擎照常搜，页面链接**不按关键词过滤**、追加在引擎结果之后（JSON 含 `pages`、`page_note`） |
 | `--suggest_queries` | v1.7.7：打印供宿主 WebSearch 用的 `site:` 查询建议（B站 opus/read、贴吧、知乎、豆瓣小组 × 「夸克 网盘」/`pan.quark.cn`），不联网；配合 `--kw` |
-| `--json` | 机器可读（含 `elapsed`、可选 `ataw_fallback`；`--from_url` 时另含 `pages` / `page_note`） |
+| `--json` | 机器可读（含 `elapsed`、可选 `ataw_fallback`、`dups`；`--from_url` 时另含 `pages` / `page_note`） |
 
 ## 公开页面直链提取（v1.7.7 `--from_url`）
 
@@ -195,13 +200,28 @@ cd <夸克网盘skill目录> && node scripts/quark-drive.cjs share-detail --url 
 | 现象 | 处理 |
 |---|---|
 | 某一源失败、其它有结果 | 交付有结果的，并注明失败源（脚本已内置，不会中断） |
-| pansou `POST` 超时 / 400 | 脚本对公开站**默认 GET**；仍失败则其余默认源（含 ataw）照常返回结果 |
-| 海搜 429 | v1.7.7 起 429/412/验证码页属**强风控**：一次即熔断冷却 30 分钟（`Retry-After` 更长则从其，上限 24h），JSON `skipped_engines` / 文本「熔断跳过: haisou(风控)」；403 与普通失败仍是 2 次 / 30 分钟。急用 `--fresh` 或 `--engine pansou,yunso` |
+| pansou `POST` 超时 / 400 | 脚本对公开站**默认 GET**；仍失败则其余默认源（含 ataw）照常返回结果；**v1.8.0 设定 50s Monotonic 耗时硬上限保险丝**，避免拖慢整组等待 |
+| 海搜 429 | v1.7.7 起 429/412/验证码页属**强风控**：一次即熔断冷却 30 分钟（`Retry-After` 更长则从其，上限 24h），JSON `skipped_engines` / 文本「熔断跳过: haisou(风控)」；403 与普通失败仍是 2 次 / 30 分钟。**v1.8.0 新增熔断生命周期自愈**：冷却时间过后自动解封并清除失败计数；引擎调用成功显式归零。急用 `--fresh` 或 `--engine pansou,yunso` |
 | 影视库 502 | `meng-ge.top` 本沙箱被拦；仅 `--engine movie` 时试，失败即跳过 |
 | ataw 单 biz 失败 | 其它 biz 仍返回；显式排除 ataw 的调用全失败时在 `errors` 里见 `ataw(fallback):` |
 | 检测接口 404 / 无服务 | 内置 8 类匿名检测可直接用（夸克/阿里/115/123/天翼/百度/蓝奏/UC）；其余类型不编有效/失效 |
 | 全部失败 | 换关键词（脚本已自动试变体 + ataw）；仍无则 WebSearch 穷尽兜底（`--suggest_queries` → `--from_url`） |
 | `--from_url` 报 blocked | 该站撞风控/登录墙，已自动停止该站；不要换 UA/重试绕过，如实告知或请用户粘贴正文 |
+
+## 版本历史
+
+| 版本 | 要点 |
+|---|---|
+| **1.8.0** | **核心体验与架构治理**：两级同名同质资源去重聚合（`norm_title`、`--all-dups` 展开、`dups` 字段）；夸克内容智能按需抽查（`--peek [smart|on|off]`、`detect_quark` 元数据探测）；熔断生命周期自愈（冷却期满归零持久化、成功显式清零）；错误消息脱敏截断（`clip_err` 剥离 debug 杂质）；废弃引擎软校验友好拦截（`ghspider` 提示改用 `--src all`）；pansou 50s 耗时硬上限保险丝。 |
+| 1.7.7 | 强风控（429/412/验证码）一次即熔断 30 分钟并遵守 Retry-After；ataw/盘小子详情并发降为 2 + 随机间隔；错误响应体限读 8KB；熔断状态原子写入；新增 `--from_url` 公开页面直链提取与 `--suggest_queries`；链接提取增强；移除 整合说明.md |
+| 1.7.6 | ataw 升为默认引擎（`--engine all` 含 ataw）；自动兜底仅保留给显式排除 ataw 的调用；README 安装指令改为一键复制框 |
+| 1.7.5 | 新增 TA搜（`ataw`）引擎与默认源自动兜底；移除 `ghspider`；TG 改走公开盘搜 `--src all`；版本与文档统一 1.7.5 |
+| 1.7.0 | 全网穷尽兜底：引擎无果 / 结果全错时穷尽全网检索，时间不限；硬约束保留 |
+| 1.6.0 | 8 类匿名核验、失效链沉底、限流退避、展示优化 |
+| 1.5.0 | 综合排序、引擎熔断、关键词变体兜底、域名表补全 |
+| 1.4.0 | 移植四级链接状态机 |
+| 1.3.0 | 新增 `panxiaozi`、`ghspider` 引擎 |
+| 1.0–1.2 | 三引擎聚合（pansou / haisou / yunso），沙箱适配与精修 |
 
 ## 检查清单
 

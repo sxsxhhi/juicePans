@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """多源网盘资源搜索（仅标准库）。默认：公开盘搜 + 海搜 + 小云搜索 + TA搜；可选盘小子、影视库。
 
-v1.7.7：--from_url 公开页面直链提取、--suggest_queries 站内检索建议、风控熔断（429/412/验证码页一次即熔断，403 按普通失败计）、同站详情限流。"""
+v1.8.0：内容级去重聚合（--all-dups 展开）、夸克内容智能按需抽查（--peek [smart|on|off]）、熔断生命周期自愈（冷却期满归零 + 成功归零）、错误消息脱敏截断、废弃引擎软校验与 pansou 50s 耗时保险丝。"""
 
 from __future__ import annotations
 
@@ -13,6 +13,7 @@ import os
 import random
 import re
 import ssl
+import subprocess
 import sys
 import time
 import urllib.error
@@ -39,7 +40,20 @@ ATAW_BIZ = ("quark", "ali", "sharepan")
 ATAW_BIZ_CLOUD = {"quark": "quark", "ali": "aliyun", "sharepan": "others"}
 ATAW_RESOURCE_RE = re.compile(r"/resources/(\d+)\?b=(quark|ali|sharepan)", re.I)
 DEFAULT_ENGINES = frozenset({"pansou", "haisou", "yunso", "ataw"})
-SKILL_VERSION = "1.7.7"
+SUPPORTED_ENGINES = frozenset({"pansou", "haisou", "yunso", "ataw", "panxiaozi", "movie", "local"})
+SKILL_VERSION = "1.8.0"
+
+PANSOU_TOTAL_TIMEOUT = 50.0  # 盘搜单次检索绝对超时硬上限（Monotonic 保险丝）
+
+# 夸克内容智能按需抽查触发词（--peek smart 命中任一词时自动激活 Top 5 抽查）
+PEEK_CONTENT_KEYWORDS = frozenset({
+    # 文档与电子书类
+    "小说", "电子书", "文档", "文本", "书单", "txt", "epub", "mobi", "pdf", "azw3",
+    # 音频与有声类
+    "有声", "有声书", "音频", "音乐", "无损", "flac", "mp3", "wav",
+    # 图像与漫画类
+    "漫画", "图集", "写真",
+})
 
 # 引擎熔断状态文件（借鉴 PanSeek「失败插件自动降级」；可用环境变量改路径）
 ENGINE_STATE_PATH = os.environ.get("ENGINE_STATE_PATH") or os.path.expanduser("~/.pan_search/engine_state.json")
@@ -193,6 +207,225 @@ def ssl_context(insecure: bool) -> ssl.SSLContext:
         ctx.check_hostname = False
         ctx.verify_mode = ssl.CERT_NONE
     return ctx
+
+
+def clip_err(msg: str, limit: int = 120) -> str:
+    """引擎错误消息超长截断与脱敏（剥离 raw JSON 中的 debug/details 等杂质，单行整洁显示）。"""
+    if not msg:
+        return ""
+    s = re.sub(r"[\r\n\t]+", " ", str(msg)).strip()
+
+    # 剔除 JSON 中的 details / debug / stack / trace 等超长冗余字段
+    s = re.sub(r',?\s*"(?:details|debug|stack|trace)"\s*:\s*\{.*?\}', '', s)
+    s = re.sub(r',?\s*"(?:details|debug|stack|trace)"\s*:\s*"(?:\\.|[^"\\])*"', '', s)
+    # 清理多余空括号与尾随逗号
+    s = re.sub(r",\s*}", "}", s)
+    s = re.sub(r"{\s*,", "{", s)
+    s = re.sub(r"\s+", " ", s).strip()
+
+    orig_len = len(s)
+    if orig_len > limit:
+        s = s[: limit - 10].rstrip() + f"…(共{orig_len}字符)"
+    return s
+
+
+def norm_title(note: str) -> str:
+    """标题规范化清洗函数（用于同名同质资源两级去重聚合）：
+    全半角统一、剥离外围装饰括注、正则剔除画质/状态/版本/渠道噪词，保留季数与显式年份。"""
+    if not note:
+        return ""
+    s = html_lib.unescape(note)
+    table = {chr(0xFF01 + i): chr(0x21 + i) for i in range(94)} | {"\u3000": " "}
+    s = s.translate(str.maketrans(table))
+
+    # 去掉文件后缀
+    s = re.sub(r"\.(?:txt|epub|mobi|pdf|azw3|mp4|mkv|ts|flv|avi|mov|rmvb|wmv|iso|zip|rar|7z)$", "", s, flags=re.I)
+
+    # 去掉常见的无意义包装前缀/后缀标签（如【夸克网盘】、【4K超清】等，但保留年份如 (2023) 或季数 (第一季)）
+    def _clean_bracket(m):
+        content = m.group(1).strip()
+        if re.fullmatch(r"(?:19|20)\d{2}", content):
+            return f"({content})"
+        if re.search(r"(?:^|[^\w])(?:S\d+|第[一二三四五六七八九十\d]+季)(?:$|[^\w])", content, re.I):
+            return f" {content} "
+        return " "
+
+    s = re.sub(r"[\[【（\(]([^\[\]\(\)【】（）]+)[\]】）\)]", _clean_bracket, s)
+
+    # 画质与编码噪词 (注意使用 (?<![a-zA-Z0-9]) 和 (?![a-zA-Z0-9]) 避免 \b 与中文字符边界问题)
+    s = re.sub(r"(?i)(?<![a-zA-Z0-9])(?:4k|8k|1080p|720p|2160p|hd|uhd|fhd|hevc|h\.?265|h\.?264|x265|x264|avc|remux|web-?dl|web-?rip|bdrip|bluray|blu-ray)(?![a-zA-Z0-9])", " ", s)
+    s = re.sub(r"(?:超清|高清|高码率|高码|原盘|自制|修复版|珍藏版|蓝光|国粤双语|双语|国语|粤语|中字|双字|无字|熟肉|生肉|压制)", " ", s)
+
+    # 状态与版本噪词
+    s = re.sub(r"(?:完整版|未删减版|未删减|精校版|校对版|精校全本|全集|合集|全\d+集|全\d+期|更新至\d+集|更新至\d+期|更至\d+集|更至\d+期|更新至\d+|更至\d+|第\d+集|第\d+期|单文件)", " ", s)
+
+    # 渠道与网盘词
+    s = re.sub(r"(?:夸克网盘|夸克|阿里云盘|阿里|百度网盘|百度|迅雷网盘|迅雷|UC网盘|UC|115网盘|115|网盘资源|网盘|资源|分享|链接)", " ", s)
+
+    # 清理多余空括号与标点
+    s = re.sub(r"[\[\(（【]\s*[\]\)）】]", " ", s)
+    s = re.sub(r"[\s\-_/\\|,，]+", " ", s).strip()
+
+    return s if s else note.strip()
+
+
+_quark_cli_detected = None
+_quark_warned = False
+
+
+def detect_quark() -> tuple[str, str] | None:
+    """探测 node 与 quark-drive.cjs 路径：
+    1. 环境变量 QUARK_SKILL_DIR
+    2. 同级 .agent/skills/quarkclouddrive/scripts/quark-drive.cjs
+    3. PATH / 系统默认位置
+    返回 (node_bin, cjs_path) 或 None。
+    """
+    global _quark_cli_detected, _quark_warned
+    if _quark_cli_detected is not None:
+        return _quark_cli_detected
+
+    import shutil
+    node_bin = os.environ.get("NODE_BIN") or shutil.which("node") or "node"
+    try:
+        res = subprocess.run([node_bin, "-v"], capture_output=True, timeout=3)
+        if res.returncode != 0:
+            node_bin = None
+    except Exception:
+        node_bin = None
+
+    if not node_bin:
+        if not _quark_warned:
+            sys.stderr.write("⚠️ 未检测到 Node.js 环境，夸克内容抽查 (--peek) 已自动降级为纯文本聚合\n")
+            _quark_warned = True
+        _quark_cli_detected = None
+        return None
+
+    candidates = []
+    q_dir = os.environ.get("QUARK_SKILL_DIR")
+    if q_dir:
+        candidates.append(os.path.join(q_dir, "scripts", "quark-drive.cjs"))
+        candidates.append(os.path.join(q_dir, "quark-drive.cjs"))
+
+    curr_dir = os.path.dirname(os.path.abspath(__file__))
+    candidates.append(os.path.abspath(os.path.join(curr_dir, "..", "..", "quarkclouddrive", "scripts", "quark-drive.cjs")))
+    candidates.append(os.path.abspath(os.path.join(curr_dir, "..", "..", "..", ".agent", "skills", "quarkclouddrive", "scripts", "quark-drive.cjs")))
+    candidates.append(r"F:\TOOLs\AI's DATA\ABC\Quark\.agent\skills\quarkclouddrive\scripts\quark-drive.cjs")
+
+    found_cjs = None
+    for cand in candidates:
+        if os.path.isfile(cand):
+            found_cjs = cand
+            break
+
+    if not found_cjs:
+        if not _quark_warned:
+            sys.stderr.write("⚠️ 未找到 quark-drive.cjs，夸克内容抽查 (--peek) 已自动降级为纯文本聚合\n")
+            _quark_warned = True
+        _quark_cli_detected = None
+        return None
+
+    _quark_cli_detected = (node_bin, found_cjs)
+    return _quark_cli_detected
+
+
+def peek_quark_detail(url: str, pwd: str = "", pdir_fid: str = "0", size: int = 1) -> dict | None:
+    quark = detect_quark()
+    if not quark:
+        return None
+    node_bin, cjs_path = quark
+    cmd = [node_bin, cjs_path, "share-detail", "--url", url, "--size", str(size), "--pdir-fid", str(pdir_fid)]
+    if pwd:
+        cmd.extend(["--passcode", pwd])
+    try:
+        proc = subprocess.run(cmd, capture_output=True, timeout=12)
+        if proc.returncode != 0:
+            return None
+        out_str = proc.stdout.decode("utf-8", errors="replace")
+        data = json.loads(out_str)
+        if data.get("code") == 0 and "data" in data:
+            return data["data"]
+    except Exception:
+        pass
+    return None
+
+
+def peek_quark(url: str, pwd: str = "") -> dict | None:
+    """夸克分享内容轻量抽查：严格遵循实测校准注记。
+    一级判定（免下钻 · 读 share_info 顶层元数据与聚合体积）：
+      - 视频主判据：share_info.size > 100MB（聚合体积）；video_total > 0 为根直挂辅助判据；
+      - 小说主判据：share_info.size < 5MB 且 title/first_file_name 含「作者：」；
+      - 引流判据：扫码/小程序/全网资源等；
+    二级判定（5MB~100MB 中间地带或单文件夹下钻首层文件列表）。
+    """
+    data = peek_quark_detail(url, pwd=pwd, pdir_fid="0", size=1)
+    if not data:
+        return None
+    share_info = data.get("share_info") or {}
+    token_info = data.get("token_info") or {}
+    size_bytes = int(share_info.get("size") or 0)
+    title = share_info.get("title") or token_info.get("title") or ""
+    first_fid = share_info.get("first_fid") or ""
+    video_total = int(share_info.get("video_total") or 0)
+    first_file = share_info.get("first_file") or {}
+    first_file_name = first_file.get("file_name") or ""
+    is_dir = bool(first_file.get("dir"))
+
+    drain_keywords = ("扫码", "小程序", "全网资源", "关注公众号", "防失联")
+    if any(k in title or k in first_file_name for k in drain_keywords):
+        return {"tag": "[内容:引流]", "text": f"{title} {first_file_name}"}
+
+    # 一级判定：小说主判据
+    if size_bytes < 5 * 1024 * 1024 and ("作者：" in title or "作者：" in first_file_name):
+        return {"tag": "[内容:小说]", "text": f"{title} {first_file_name}"}
+
+    # 一级判定：视频主判据（实测：剧集文件夹分享 video_total 恒为 0，聚合 size 为数十 GB）
+    if size_bytes > 100 * 1024 * 1024 or (video_total > 0 and not is_dir):
+        size_gb = size_bytes / (1024 ** 3)
+        size_str = f"{size_gb:.1f}GB" if size_gb >= 1.0 else f"{size_bytes / (1024 ** 2):.0f}MB"
+        return {"tag": f"[内容:视频 {size_str}]", "text": f"{title} {first_file_name}"}
+
+    # 二级判定：5MB~100MB 中间地带或单文件夹下钻首层
+    if first_fid and first_fid != "0":
+        drill = peek_quark_detail(url, pwd=pwd, pdir_fid=first_fid, size=50)
+        if drill:
+            sub_files = drill.get("files") or []
+            sub_names = [f.get("filename") or f.get("file_name") or "" for f in sub_files]
+            combined_text = f"{title} {first_file_name} " + " ".join(sub_names)
+
+            if any(k in combined_text for k in drain_keywords):
+                return {"tag": "[内容:引流]", "text": combined_text}
+
+            # 检查小说文件
+            has_novel_ext = any(re.search(r"\.(?:txt|epub|mobi|azw3)$", n, re.I) for n in sub_names)
+            if has_novel_ext:
+                return {"tag": "[内容:小说]", "text": combined_text}
+
+            # 检查视频文件
+            has_video = any(re.search(r"\.(?:mp4|mkv|ts|flv|avi|mov|rmvb|wmv)$", n, re.I) for n in sub_names)
+            has_ep = any(re.search(r"(?:EP?\d+|第\d+[集期])", n, re.I) for n in sub_names)
+            if has_video or has_ep:
+                size_gb = size_bytes / (1024 ** 3)
+                size_str = f"{size_gb:.1f}GB" if size_gb >= 1.0 else f"{size_bytes / (1024 ** 2):.0f}MB"
+                return {"tag": f"[内容:视频 {size_str}]" if size_bytes > 0 else "[内容:视频]", "text": combined_text}
+
+            return {"tag": "", "text": combined_text}
+
+    return {"tag": "", "text": f"{title} {first_file_name}"}
+
+
+def should_peek(peek_mode: str, exclude: list[str] | None) -> bool:
+    """是否激活夸克内容抽查：
+    - off: 完全关闭
+    - on: 强制开启
+    - smart: 当 exclude 中命中内容题材关键词（小说/文档/txt/epub等）时自动激活
+    """
+    if peek_mode == "off":
+        return False
+    if peek_mode == "on":
+        return True
+    if not exclude:
+        return False
+    return any(x.lower().strip() in PEEK_CONTENT_KEYWORDS for x in exclude)
 
 
 class RiskControlError(RuntimeError):
@@ -673,6 +906,7 @@ def item(cloud: str, url: str, password: str = "", note: str = "", source: str =
 
 
 def search_pansou(base: str, kw: str, cloud_types, include, exclude, src: str, refresh: bool, label: str, pansou_timeout: float = 45.0):
+    t0 = time.monotonic()
     body = {"kw": kw, "res": "merge", "src": src, "conc": 5}
     if cloud_types:
         body["cloud_types"] = [canon_type(x) for x in cloud_types]
@@ -700,12 +934,16 @@ def search_pansou(base: str, kw: str, cloud_types, include, exclude, src: str, r
     last_err = None
     data = None
     for method, url in order:
+        elapsed = time.monotonic() - t0
+        budget_left = min(pansou_timeout, PANSOU_TOTAL_TIMEOUT - elapsed)
+        if budget_left <= 3.0:
+            raise TimeoutError("pansou 总耗时超限 (50s)")
         try:
             if method == "GET":
-                data = unwrap_pansou(http_json(url, timeout=pansou_timeout))
+                data = unwrap_pansou(http_json(url, timeout=budget_left))
             else:
                 data = unwrap_pansou(
-                    http_json(base.rstrip("/") + "/api/search", method="POST", body=body, timeout=pansou_timeout)
+                    http_json(base.rstrip("/") + "/api/search", method="POST", body=body, timeout=budget_left)
                 )
             break
         except Exception as e:
@@ -988,31 +1226,115 @@ def should_ataw_fallback(engines: list, items: list) -> bool:
 
 
 def finalize_items(items: list, args, cloud_types, include, exclude) -> list:
-    seen = set()
-    merged = []
+    # 1. 一级：pass_filters 初筛 + norm_url 精确去重
+    raw_seen = set()
+    raw_filtered = []
     for rec in items:
         if not pass_filters(rec, include, exclude, cloud_types):
             continue
-        key = norm_url(rec["url"])
-        if not key or key in seen:
+        key = norm_url(rec.get("url") or "")
+        if not key or key in raw_seen:
             continue
-        seen.add(key)
-        merged.append(rec)
-    merged.sort(key=lambda r: r.get("datetime") or "", reverse=True)
-    merged.sort(key=lambda r: (-kw_hits(r, args.kw), ENGINE_RANK.get(r.get("source") or "", 5)))
+        raw_seen.add(key)
+        raw_filtered.append(rec)
+
+    # 2. 二级：(cloud, norm_title) 归一化标题分组聚合
+    grouped = {}
+    for rec in raw_filtered:
+        c = rec.get("cloud") or "others"
+        nt = norm_title(rec.get("note") or "")
+        g_key = (c, nt) if nt else (c, norm_url(rec.get("url") or ""))
+        grouped.setdefault(g_key, []).append(rec)
+
+    # 3. 组内优选主条目：kw_hits 匹配度高者优先 → 包含日期更新者优先 → ENGINE_RANK 权重靠前优先
+    #    主条目注入 dups: [{"url": u, "note": n, "source": s}, ...] 数组
+    kw = getattr(args, "kw", "") or ""
+    primary_items = []
+    groups_list = []
+    for g_key, grp in grouped.items():
+        def _item_sort_key(r):
+            hits = kw_hits(r, kw)
+            dt = r.get("datetime") or ""
+            dt_num = int(re.sub(r"\D", "", dt[:10])) if re.sub(r"\D", "", dt[:10]) else 0
+            src = (r.get("source") or "").split(":")[0]
+            rank = ENGINE_RANK.get(src, 5)
+            return (-hits, -dt_num, rank)
+
+        grp.sort(key=_item_sort_key)
+        primary = grp[0]
+        dups = [{"url": r["url"], "note": r.get("note") or "", "source": r.get("source") or ""} for r in grp[1:]]
+        if dups:
+            primary["dups"] = dups
+        primary_items.append(primary)
+        groups_list.append((primary, grp))
+
+    # 4. 全局排序：日期新鲜度、关键词命中率与来源等级、失效链接沉底
+    primary_items.sort(key=lambda r: r.get("datetime") or "", reverse=True)
+    primary_items.sort(key=lambda r: (-kw_hits(r, kw), ENGINE_RANK.get((r.get("source") or "").split(":")[0], 5)))
     dead = load_dead_links()
     if dead:
-        merged.sort(key=lambda r: norm_url(r["url"]) in dead)
+        primary_items.sort(key=lambda r: norm_url(r["url"]) in dead)
+
+    # 5. 夸克内容智能按需抽查 (--peek [smart|on|off])
+    peek_mode = getattr(args, "peek", "smart")
+    if should_peek(peek_mode, exclude):
+        quark_targets = [r for r in primary_items if r.get("cloud") == "quark"][:5]
+        if quark_targets:
+            def _do_peek(rec):
+                res = peek_quark(rec.get("url") or "", rec.get("password") or "")
+                return rec, res
+
+            with ThreadPoolExecutor(max_workers=min(5, len(quark_targets))) as pool:
+                for fut in as_completed([pool.submit(_do_peek, r) for r in quark_targets]):
+                    try:
+                        rec, res = fut.result()
+                        if res:
+                            if res.get("tag"):
+                                rec["content_tag"] = res["tag"]
+                            if res.get("text"):
+                                rec["content_peek"] = res["text"]
+                    except Exception:
+                        pass
+
+        # 抽查后重新联动 pass_filters：若主条目被排除（如命中小说/引流），整组过滤
+        surviving_primaries = []
+        for rec in primary_items:
+            if pass_filters(rec, include, exclude, cloud_types):
+                surviving_primaries.append(rec)
+        primary_items = surviving_primaries
+
+    # 内容权重参与排序：纯小说/广告引流资源在常规影视搜索中沉底
+    primary_items.sort(key=lambda r: 1 if r.get("content_tag") in ("[内容:小说]", "[内容:引流]") else 0)
+
+    # 6. 处理 --all-dups：若开启则展开全部同名同质副本集合；否则保留折叠主条目
+    if getattr(args, "all_dups", False):
+        surviving_primary_urls = {norm_url(p["url"]) for p in primary_items}
+        expanded = []
+        for primary, grp in groups_list:
+            if norm_url(primary["url"]) in surviving_primary_urls:
+                expanded.extend(grp)
+        # 保持排序
+        expanded.sort(key=lambda r: r.get("datetime") or "", reverse=True)
+        expanded.sort(key=lambda r: (-kw_hits(r, kw), ENGINE_RANK.get((r.get("source") or "").split(":")[0], 5)))
+        if dead:
+            expanded.sort(key=lambda r: norm_url(r["url"]) in dead)
+        expanded.sort(key=lambda r: 1 if r.get("content_tag") in ("[内容:小说]", "[内容:引流]") else 0)
+        final_list = expanded
+    else:
+        final_list = primary_items
+
+    # 7. 限制每网盘展示条数
     if args.limit > 0:
         counts = {}
         trimmed = []
-        for rec in merged:
+        for rec in final_list:
             c = rec["cloud"]
             counts[c] = counts.get(c, 0) + 1
             if counts[c] <= args.limit:
                 trimmed.append(rec)
-        merged = trimmed
-    return merged
+        final_list = trimmed
+
+    return final_list
 
 
 def norm_url(url: str) -> str:
@@ -1027,7 +1349,8 @@ def norm_url(url: str) -> str:
 def pass_filters(rec: dict, include, exclude, cloud_types) -> bool:
     if cloud_types and rec["cloud"] not in {canon_type(x) for x in cloud_types}:
         return False
-    blob = " ".join([rec.get("note") or "", rec.get("url") or ""]).lower()
+    peek_blob = " ".join(filter(None, [rec.get("content_tag"), rec.get("content_peek")]))
+    blob = " ".join(filter(None, [rec.get("note"), rec.get("url"), peek_blob])).lower()
     if include and not all(x.lower() in blob for x in include):
         return False
     if exclude and any(x.lower() in blob for x in exclude):
@@ -1128,8 +1451,12 @@ def format_text(kw: str, items: list, errors: list, totals: dict) -> str:
                 meta.append("%s 个文件" % rec["files"])
             if rec.get("hot"):
                 meta.append("热门")
+            if rec.get("content_tag"):
+                meta.append(rec["content_tag"])
             if meta:
                 lines.append("     来源: " + " | ".join(meta))
+            if rec.get("dups"):
+                lines.append("     ↳ 另有 %d 个同资源副本链接（已折叠，--all-dups 展开）" % len(rec["dups"]))
             lines.append("")
     return "\n".join(lines)
 
@@ -1172,7 +1499,32 @@ def load_engine_state() -> dict:
     try:
         with open(ENGINE_STATE_PATH, encoding="utf-8-sig") as f:  # utf-8-sig 容错 PowerShell 写入的 BOM
             st = json.load(f)
-        return st if isinstance(st, dict) else {}
+        if not isinstance(st, dict):
+            return {}
+        now = datetime.now()
+        changed = False
+        for name in list(st.keys()):
+            e = st[name]
+            if not isinstance(e, dict):
+                continue
+            fails = int(e.get("fails") or 0)
+            is_risk = bool(e.get("risk"))
+            if not is_risk and fails < ENGINE_FAIL_LIMIT:
+                continue
+            try:
+                cd = int(e.get("cooldown_min") or (RISK_COOLDOWN_MIN if is_risk else ENGINE_COOLDOWN_MIN))
+            except (TypeError, ValueError):
+                cd = RISK_COOLDOWN_MIN if is_risk else ENGINE_COOLDOWN_MIN
+            try:
+                last = datetime.fromisoformat(e.get("last_fail") or "")
+                if (now - last) >= timedelta(minutes=cd):
+                    st.pop(name, None)
+                    changed = True
+            except ValueError:
+                pass
+        if changed:
+            save_engine_state(st)
+        return st
     except (OSError, ValueError):
         return {}
 
@@ -1207,22 +1559,30 @@ def save_engine_state(st: dict) -> None:
 
 def engine_blocked(name: str, st: dict) -> bool:
     """连续 ENGINE_FAIL_LIMIT 次失败后冷却 ENGINE_COOLDOWN_MIN 分钟（PanSeek 插件熔断的脚本化移植）。
-    v1.7.7：强风控失败（risk=True：429/412/验证码页）一次即冷却 cooldown_min 分钟（默认 RISK_COOLDOWN_MIN）。"""
+    v1.7.7：强风控失败（risk=True：429/412/验证码页）一次即冷却 cooldown_min 分钟（默认 RISK_COOLDOWN_MIN）。
+    v1.8.0：冷却期满后就地归零并持久化写回（抹平存量脏数据）。"""
     e = st.get(name) or {}
-    if e.get("risk"):
+    if not e:
+        return False
+    is_risk = bool(e.get("risk"))
+    if not is_risk and int(e.get("fails") or 0) < ENGINE_FAIL_LIMIT:
+        return False
+    if is_risk:
         try:
             cd = int(e.get("cooldown_min") or RISK_COOLDOWN_MIN)
         except (TypeError, ValueError):
             cd = RISK_COOLDOWN_MIN
-    elif int(e.get("fails") or 0) < ENGINE_FAIL_LIMIT:
-        return False
     else:
         cd = ENGINE_COOLDOWN_MIN
     try:
         last = datetime.fromisoformat(e.get("last_fail") or "")
     except ValueError:
         return False
-    return (datetime.now() - last) < timedelta(minutes=cd)
+    if (datetime.now() - last) >= timedelta(minutes=cd):
+        st.pop(name, None)
+        save_engine_state(st)
+        return False
+    return True
 
 
 _RISK_MSG_STRONG_RE = re.compile(
@@ -1268,6 +1628,12 @@ def mark_engine_failure(st: dict, name: str, level: int = 0, retry_after: int = 
     st[name] = e
 
 
+def mark_engine_success(st: dict, name: str) -> None:
+    """引擎成功执行显式归零：彻底移除失败记录并重置额度。"""
+    if name in st:
+        st.pop(name, None)
+
+
 def risk_blocked(name: str, st: dict) -> bool:
     return bool((st.get(name) or {}).get("risk")) and engine_blocked(name, st)
 
@@ -1303,7 +1669,7 @@ def _search_once(args, engines, cloud_types, include, exclude, kw=None, elapsed=
                 totals[name] = total
                 by_name[name] = rows
             except Exception as e:
-                errors.append("%s: %s" % (name, e))
+                errors.append(clip_err("%s: %s" % (name, e)))
                 level, retry_after = risk_info(e)
                 if level:
                     risky[name] = (level, retry_after)
@@ -1315,7 +1681,9 @@ def _search_once(args, engines, cloud_types, include, exclude, kw=None, elapsed=
     changed = False
     for name in jobs:
         if name in by_name:
-            changed |= st.pop(name, None) is not None
+            if name in st:
+                mark_engine_success(st, name)
+                changed = True
         elif any(x.startswith(name + ":") for x in errors):
             level, retry_after = risky.get(name, (0, 0))
             mark_engine_failure(st, name, level, retry_after)  # v1.7.7：强风控一次即熔断
@@ -1384,6 +1752,20 @@ def run(args):
     if "all" in engines:
         # all = 默认四源（含 ataw），且保留同批次显式指定的其它引擎（如 all,panxiaozi）
         engines = ["pansou", "haisou", "yunso", "ataw"] + [e for e in engines if e not in ("all", "pansou", "haisou", "yunso", "ataw")]
+
+    # WP2: 引擎软校验机制（友好拦截未知引擎与废弃 ghspider）
+    valid_engines = []
+    for e in engines:
+        if e == "ghspider":
+            sys.stderr.write('⚠️ 引擎 "ghspider" 已于 v1.7.5 废弃移除，TG 频道资源检索请使用: python scripts/search.py --kw "..." --src all\n')
+            continue
+        if e not in SUPPORTED_ENGINES:
+            sys.stderr.write('⚠️ 未知引擎 "%s"，已跳过（可用: pansou,haisou,yunso,ataw,panxiaozi,movie,local）\n' % e)
+            continue
+        if e not in valid_engines:
+            valid_engines.append(e)
+    engines = valid_engines
+
     cloud_types = split_csv(args.cloud_types)
     include = split_csv(args.include)
     exclude = split_csv(args.exclude)
@@ -1412,7 +1794,7 @@ def run(args):
                 variant_used = v
                 items = v_items
                 totals = v_totals
-                errors = errors + ["变体「%s」: %s" % (v, e) for e in v_errors]
+                errors = errors + [clip_err("变体「%s」: %s" % (v, e)) for e in v_errors]
                 break
 
     ataw_fallback = False
@@ -1426,7 +1808,7 @@ def run(args):
                 totals["ataw"] = fb_total
                 items = finalize_items(items + fb_rows, args, cloud_types, include, exclude)
         except Exception as e:
-            errors.append("ataw(fallback): %s" % e)
+            errors.append(clip_err("ataw(fallback): %s" % e))
             level, retry_after = risk_info(e)
             if level >= 2:  # 兜底撞强风控也记入熔断，下次兜底直接跳过
                 st_fb = load_engine_state()
@@ -1488,7 +1870,7 @@ def main():
     p.add_argument("--include", help="结果须含这些词，逗号分隔")
     p.add_argument("--exclude", help="排除这些词，逗号分隔")
     p.add_argument("--src", default="plugin", choices=["all", "tg", "plugin"], help="盘搜数据源，默认 plugin（更快更稳）")
-    p.add_argument("--engine", default="pansou,haisou,yunso,ataw", help="pansou,haisou,yunso,ataw,panxiaozi,movie,local；all=默认四源（含 ataw）；ataw 已是默认引擎，显式排除后默认源无果时仍会自动兜底")
+    p.add_argument("--engine", default="pansou,haisou,yunso,ataw", help="pansou,haisou,yunso,ataw,panxiaozi,movie,local；all=默认四源；若遇废弃引擎（如 ghspider）自动友好提示")
     p.add_argument("--scope", default="title", choices=["title", "files"], help="海搜范围")
     p.add_argument("--yunso_mode", default="90001", choices=["90001", "90002"], help="小云搜索：90001智能 / 90002精准")
     p.add_argument("--min_size", type=float, help="海搜最小体积 GB")
@@ -1502,6 +1884,8 @@ def main():
     p.add_argument("--no-variants", action="store_true", help="禁用 0 结果时的关键词变体自动重试")
     p.add_argument("--from_url", help="公开页面 URL，逗号分隔，单次最多 %d 个：抓页面提取网盘直链（无 --kw 时只做页面提取）" % PAGE_MAX_URLS)
     p.add_argument("--suggest_queries", action="store_true", help="打印供宿主 WebSearch 用的 site: 查询建议（配合 --kw），不联网")
+    p.add_argument("--all-dups", action="store_true", help="展开全部同名同质资源副本（默认折叠同名资源并注记副本数）")
+    p.add_argument("--peek", choices=["smart", "on", "off"], default="smart", help="夸克网盘内容智能抽查模式：smart（默认，命中小说/电子书等排除词时自动触发）、on（强制抽查 Top 5）、off（关闭抽查，秒级返回）")
     p.add_argument("--json", action="store_true")
     args = p.parse_args()
     if args.kw is not None and not args.kw.strip():
