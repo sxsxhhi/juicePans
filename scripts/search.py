@@ -225,7 +225,8 @@ def clip_err(msg: str, limit: int = 120) -> str:
 
     orig_len = len(s)
     if orig_len > limit:
-        s = s[: limit - 10].rstrip() + f"…(共{orig_len}字符)"
+        suffix = f"…(共{orig_len}字符)"
+        s = s[: max(0, limit - len(suffix))].rstrip() + suffix
     return s
 
 
@@ -241,14 +242,28 @@ def norm_title(note: str) -> str:
     # 去掉文件后缀
     s = re.sub(r"\.(?:txt|epub|mobi|pdf|azw3|mp4|mkv|ts|flv|avi|mov|rmvb|wmv|iso|zip|rar|7z)$", "", s, flags=re.I)
 
-    # 去掉常见的无意义包装前缀/后缀标签（如【夸克网盘】、【4K超清】等，但保留年份如 (2023) 或季数 (第一季)）
+    # 纯噪词与渠道词标签模式（用于判断括号标签是否为纯噪词/渠道词/分类词）
+    _NOISE_WORDS_PAT = (
+        r"(?i)^(?:4k|8k|1080p|720p|2160p|hd|uhd|fhd|hevc|h\.?265|h\.?264|x265|x264|avc|remux|web-?dl|web-?rip|bdrip|bluray|blu-ray|"
+        r"超清|高清|高码率|高码|原盘|自制|修复版|珍藏版|蓝光|国粤双语|双语|国语|粤语|中字|双字|无字|熟肉|生肉|压制|"
+        r"完整版|未删减版|未删减|精校版|校对版|精校全本|全集|合集|全\d+集|全\d+期|更新至\d+集|更新至\d+期|更至\d+集|更至\d+期|更新至\d+|更至\d+|第\d+集|第\d+期|单文件|"
+        r"夸克网盘|夸克|阿里云盘|阿里|百度网盘|百度|迅雷网盘|迅雷|UC网盘|UC|115网盘|115|网盘资源|网盘|资源|分享|链接|"
+        r"美剧|韩剧|日剧|国产剧|国剧|港剧|台剧|泰剧|英剧|电视剧|电影|动漫|纪录片|综艺|"
+        r"内嵌|官译|杜比|视界|HDR|SDR|60帧|120帧|无水印|去水印|纯净版|防失联|扫码|关注)+$"
+    )
+
+    # 去掉常见的无意义包装前缀/后缀标签（如【夸克网盘】、【4K超清】等，但保留年份如 (2023) 或季数 (第一季)，保留被括号包裹的真实标题）
     def _clean_bracket(m):
         content = m.group(1).strip()
         if re.fullmatch(r"(?:19|20)\d{2}", content):
             return f"({content})"
         if re.search(r"(?:^|[^\w])(?:S\d+|第[一二三四五六七八九十\d]+季)(?:$|[^\w])", content, re.I):
             return f" {content} "
-        return " "
+        clean_content = re.sub(r"[\s\-_/\\|,，]+", "", content)
+        if re.match(_NOISE_WORDS_PAT, clean_content):
+            return " "
+        # 否则若为片名等有意义内容（如【去你的岛】、【流浪地球2】），剥离外层括号保留内部文本
+        return f" {content} "
 
     s = re.sub(r"[\[【（\(]([^\[\]\(\)【】（）]+)[\]】）\)]", _clean_bracket, s)
 
@@ -282,7 +297,7 @@ def detect_quark() -> tuple[str, str] | None:
     """
     global _quark_cli_detected, _quark_warned
     if _quark_cli_detected is not None:
-        return _quark_cli_detected
+        return _quark_cli_detected or None
 
     import shutil
     node_bin = os.environ.get("NODE_BIN") or shutil.which("node") or "node"
@@ -297,7 +312,7 @@ def detect_quark() -> tuple[str, str] | None:
         if not _quark_warned:
             sys.stderr.write("⚠️ 未检测到 Node.js 环境，夸克内容抽查 (--peek) 已自动降级为纯文本聚合\n")
             _quark_warned = True
-        _quark_cli_detected = None
+        _quark_cli_detected = False
         return None
 
     candidates = []
@@ -321,7 +336,7 @@ def detect_quark() -> tuple[str, str] | None:
         if not _quark_warned:
             sys.stderr.write("⚠️ 未找到 quark-drive.cjs，夸克内容抽查 (--peek) 已自动降级为纯文本聚合\n")
             _quark_warned = True
-        _quark_cli_detected = None
+        _quark_cli_detected = False
         return None
 
     _quark_cli_detected = (node_bin, found_cjs)
@@ -374,15 +389,18 @@ def peek_quark(url: str, pwd: str = "") -> dict | None:
     if any(k in title or k in first_file_name for k in drain_keywords):
         return {"tag": "[内容:引流]", "text": f"{title} {first_file_name}"}
 
-    # 一级判定：小说主判据
-    if size_bytes < 5 * 1024 * 1024 and ("作者：" in title or "作者：" in first_file_name):
+    # 一级判定：小说主判据（支持全半角冒号与顶层直接分享 txt/epub 扩展名）
+    has_author = bool(re.search(r"作者[：:]", f"{title} {first_file_name}"))
+    has_novel_ext_top = bool(re.search(r"\.(?:txt|epub|mobi|azw3)\b", f"{title} {first_file_name}", re.I))
+    if size_bytes < 5 * 1024 * 1024 and (has_author or has_novel_ext_top):
         return {"tag": "[内容:小说]", "text": f"{title} {first_file_name}"}
 
-    # 一级判定：视频主判据（实测：剧集文件夹分享 video_total 恒为 0，聚合 size 为数十 GB）
-    if size_bytes > 100 * 1024 * 1024 or (video_total > 0 and not is_dir):
+    # 一级判定：视频主判据（实测：剧集文件夹分享 video_total 恒为 0，聚合 size 为数十 GB；单文件直挂按扩展名或 video_total）
+    has_video_ext_top = bool(re.search(r"\.(?:mp4|mkv|ts|flv|avi|mov|rmvb|wmv)\b", first_file_name, re.I))
+    if size_bytes > 100 * 1024 * 1024 or (video_total > 0 and not is_dir) or (not is_dir and has_video_ext_top):
         size_gb = size_bytes / (1024 ** 3)
         size_str = f"{size_gb:.1f}GB" if size_gb >= 1.0 else f"{size_bytes / (1024 ** 2):.0f}MB"
-        return {"tag": f"[内容:视频 {size_str}]", "text": f"{title} {first_file_name}"}
+        return {"tag": f"[内容:视频 {size_str}]" if size_bytes > 0 else "[内容:视频]", "text": f"{title} {first_file_name}"}
 
     # 二级判定：5MB~100MB 中间地带或单文件夹下钻首层
     if first_fid and first_fid != "0":
@@ -1312,7 +1330,10 @@ def finalize_items(items: list, args, cloud_types, include, exclude) -> list:
         expanded = []
         for primary, grp in groups_list:
             if norm_url(primary["url"]) in surviving_primary_urls:
-                expanded.extend(grp)
+                for r in grp:
+                    item_copy = dict(r)
+                    item_copy.pop("dups", None)  # 展开平铺模式下不再携带折叠提示
+                    expanded.append(item_copy)
         # 保持排序
         expanded.sort(key=lambda r: r.get("datetime") or "", reverse=True)
         expanded.sort(key=lambda r: (-kw_hits(r, kw), ENGINE_RANK.get((r.get("source") or "").split(":")[0], 5)))
@@ -1507,10 +1528,7 @@ def load_engine_state() -> dict:
             e = st[name]
             if not isinstance(e, dict):
                 continue
-            fails = int(e.get("fails") or 0)
             is_risk = bool(e.get("risk"))
-            if not is_risk and fails < ENGINE_FAIL_LIMIT:
-                continue
             try:
                 cd = int(e.get("cooldown_min") or (RISK_COOLDOWN_MIN if is_risk else ENGINE_COOLDOWN_MIN))
             except (TypeError, ValueError):
